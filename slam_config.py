@@ -30,6 +30,7 @@ class SLAMConfig:
     relocalization_threshold_percent: float = 10 # Threshold for the relocalization matches in percent
     max_relocalization_threshold: float = 0.23
     relocalization_frame_overlap: int = 10 # Number of frames to overlap at start and end of a localized sequence
+    relocalization_gps_max_pair_distance_m: float = 50.0 # Max allowed GPS distance (meters) between query and matched reference priors
     
     # --- Point Cloud Generation ---
     max_depth_for_point_cloud: float = 5.0 # Max depth in meters to include in the final PCL
@@ -37,6 +38,3 @@ class SLAMConfig:
 
     # --- Debugging ---
     create_debug_chunk_visualizations: bool = False # If True, saves a PLY for each chunk's PCL and trajectory
-
-    # --- Pre-processing ---
-    crop_bottom_percent: float = 0.0 # Percentage of the image to crop from the bottom before processing

@@ -81,15 +81,7 @@ class VisualSLAM:
     def __init__(self, config: SLAMConfig):
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        # --- Adjust for Image Cropping ---
-        if self.config.crop_bottom_percent > 0:
-            print(f"Cropping enabled: Removing bottom {self.config.crop_bottom_percent}% of images.")
-            original_w, original_h = self.config.org_image_size
-            new_h = int(original_h * (1.0 - self.config.crop_bottom_percent / 100.0))
-            self.config.org_image_size = (original_w, new_h)
-            print(f"Adjusted original image size from {(original_w, original_h)} to {self.config.org_image_size} for intrinsics calculation.")
-        
+
         self._setup_paths()
         self.map_anything = None
         self.place_net = None
@@ -105,8 +97,10 @@ class VisualSLAM:
             self._cache_frames()
 
     def _setup_paths(self):
-        """Creates output paths relative to the image folder if they are not specified."""
-        results_dir_base = self.config.video_path or self.config.image_folder
+        """Creates output paths relative to the video path (video-only)."""
+        if not self.config.video_path:
+            raise ValueError("Video-only mode: 'video_path' must be provided.")
+        results_dir_base = self.config.video_path
         if self.config.output_dir is None or self.config.database_path is None:
             results_dir = os.path.join(os.path.dirname(results_dir_base), "_slam_results")
             os.makedirs(results_dir, exist_ok=True)
@@ -298,7 +292,8 @@ class VisualSLAM:
         
         # Load the existing database for relocalization
         print("Loading relocalization database...")
-        db_data = torch.load(self.config.relocalization_db_path, weights_only=False)
+        db_raw = torch.load(self.config.relocalization_db_path, weights_only=False)
+        db_data = self._unpack_reference_db(db_raw)
         
         # --- Find optimal start/end frames using Place Recognition ---
         processed_image_paths = self._find_and_prepare_localization_frames(db_data)
@@ -309,60 +304,126 @@ class VisualSLAM:
 
         self._run_pipeline(relocalization_db=db_data, localization_frames=processed_image_paths)
 
+    def _unpack_reference_db(self, db_data):
+        """Return (reference_db, reference_vectors) from saved database in a backward-compatible way.
+        - If db_data is a (list, tensor) tuple, return as-is
+        - If db_data is a list of dicts, try to stack 'place_net_descriptor'; otherwise compute vectors from images
+        """
+        try:
+            if isinstance(db_data, tuple) and len(db_data) == 2:
+                reference_db, reference_vectors = db_data
+                if not isinstance(reference_vectors, torch.Tensor):
+                    reference_vectors = torch.tensor(reference_vectors)
+                return reference_db, reference_vectors
+            # Fallback: legacy format as list of entries
+            if isinstance(db_data, list):
+                reference_db = db_data
+                if len(reference_db) > 0 and 'place_net_descriptor' in reference_db[0]:
+                    vectors = []
+                    for e in reference_db:
+                        v = e['place_net_descriptor']
+                        if isinstance(v, torch.Tensor):
+                            vectors.append(v.squeeze().cpu())
+                        else:
+                            vectors.append(torch.tensor(v).squeeze())
+                    reference_vectors = torch.stack(vectors, dim=0)
+                    return reference_db, reference_vectors
+                # Compute vectors from stored images
+                vectors = []
+                for e in reference_db:
+                    p = e.get('image_path')
+                    try:
+                        img_bgr = cv2.imread(p)
+                        if img_bgr is None:
+                            vectors.append(torch.zeros(128))
+                            continue
+                        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                        vec = self.place_net(img_rgb)
+                        vectors.append(torch.from_numpy(vec).squeeze())
+                    except Exception:
+                        vectors.append(torch.zeros(128))
+                reference_vectors = torch.stack(vectors, dim=0)
+                return reference_db, reference_vectors
+        except Exception as e:
+            print(f"Warning: Failed to unpack reference DB flexibly: {e}")
+        # As a last resort, treat as empty
+        return [], torch.empty(0)
+
     def _find_and_prepare_localization_frames(self, db_data):
-        """Finds the best start/end frames for localization and prepares the frame list."""
-        
-        # 1. Unpack database
-        reference_db, reference_vectors = db_data
+        """
+        Localize a query sub-sequence to the reference by:
+        1) Comparing query place vectors to the first and last reference vectors to get start/end query indices
+        2) Expanding by a small buffer
+        3) Trimming internal query buffers to this window to save memory
+        4) Returning the trimmed query frame identifiers (e.g., 'frame_0', ...)
+        """
+        # 1. Unpack database (supports legacy formats)
+        reference_db, reference_vectors = self._unpack_reference_db(db_data)
         reference_vectors = reference_vectors.to(self.device)
         print(f"Loaded reference database with {len(reference_db)} entries.")
 
-        # 2. Calculate place vectors for the new video sequence
+        # 2. Calculate place vectors for the query sequence (strided)
         print("Calculating place recognition vectors for the new sequence...")
-        query_vectors = []
-        for frame_idx in range(len(self.frame_buffer)):
-            if frame_idx % self.config.stride == 0:
-                frame = self._get_views_from_buffer([f"frame_{frame_idx}"])[0]
-                img_for_place_net = rgb(frame['img'], frame['data_norm_type'][0])[0] * 255
-                vector = self.place_net(img_for_place_net)
-                query_vectors.append(torch.from_numpy(vector).squeeze())
-        
-        if not query_vectors:
+        query_indices = [idx for idx in range(len(self.frame_buffer)) if idx % self.config.stride == 0]
+        if not query_indices:
             return []
-            
+        query_vectors = [torch.from_numpy(self.place_net_descriptors[idx]).squeeze() for idx in query_indices]
         query_vectors = torch.stack(query_vectors).to(self.device)
         print(f"Calculated {len(query_vectors)} place vectors for the query video.")
 
-        # 3. Find the best match for the start and end of the query sequence
-        similarities = torch.cdist(query_vectors, reference_vectors)
-        
-        # Find best match for the query start
-        best_match_for_start_query = torch.argmin(similarities[0])
-        start_ref_idx = best_match_for_start_query.item()
-        
-        # Find best match for the query end
-        best_match_for_end_query = torch.argmin(similarities[-1])
-        end_ref_idx = best_match_for_end_query.item()
+        # 3. Find best matching query frames for reference first and last
+        sim_start = torch.cdist(query_vectors, reference_vectors[[0]])
+        sim_end = torch.cdist(query_vectors, reference_vectors[[-1]])
+        start_query_vec_idx = torch.argmin(sim_start).item()
+        end_query_vec_idx = torch.argmin(sim_end).item()
+        start_query_frame_idx = query_indices[start_query_vec_idx]
+        end_query_frame_idx = query_indices[end_query_vec_idx]
+        if start_query_frame_idx > end_query_frame_idx:
+            start_query_frame_idx, end_query_frame_idx = end_query_frame_idx, start_query_frame_idx
+        print(f"Best query frame indices: start={start_query_frame_idx}, end={end_query_frame_idx}")
 
-        print(f"Best match for start of query: Reference frame {start_ref_idx}")
-        print(f"Best match for end of query: Reference frame {end_ref_idx}")
-
-        # 4. Define the sub-sequence from the reference database to use for reconstruction
-        # Add a small overlap at the start and end
+        # 4. Add buffer around start/end and trim buffers
         overlap = self.config.relocalization_frame_overlap
-        start_frame_idx = max(0, start_ref_idx - overlap)
-        end_frame_idx = min(len(reference_db), end_ref_idx + overlap)
-
-        # Ensure start is before end
-        if start_frame_idx >= end_frame_idx:
-            print("Warning: Start frame is after end frame. Localization might fail.")
+        q_start = max(0, start_query_frame_idx - overlap)
+        q_end = min(len(self.frame_buffer), end_query_frame_idx + overlap + 1)
+        print(f"Trimming query to [{q_start}, {q_end}) with overlap {overlap}.")
+        if q_start >= q_end:
+            print("Warning: Computed empty query window. Aborting localization selection.")
             return []
 
-        # Get the image paths from the reference DB for this sub-sequence
-        selected_paths = [reference_db[i]['image_path'] for i in range(start_frame_idx, end_frame_idx)]
-        print(f"Selected {len(selected_paths)} frames for localization (from {start_frame_idx} to {end_frame_idx}) including overlap.")
-        
-        return selected_paths
+        # Optional GPS gate to ensure rough consistency between query ends and reference ends
+        if self.telemetry and hasattr(self, 'gps_ned') and self.gps_ned is not None and len(reference_db) >= 2:
+            try:
+                qs_tns = self.frametimes_ns[q_start]
+                qe_tns = self.frametimes_ns[q_end - 1]
+                if qs_tns in self.gps_ned and qe_tns in self.gps_ned:
+                    q_start_ned = np.array(self.gps_ned[qs_tns])
+                    q_end_ned = np.array(self.gps_ned[qe_tns])
+                    r_start_ned = reference_db[0].get('gps_ned', None)
+                    r_end_ned = reference_db[-1].get('gps_ned', None)
+                    if r_start_ned is not None and r_end_ned is not None:
+                        r_start_ned = r_start_ned.cpu().numpy() if isinstance(r_start_ned, torch.Tensor) else np.array(r_start_ned)
+                        r_end_ned = r_end_ned.cpu().numpy() if isinstance(r_end_ned, torch.Tensor) else np.array(r_end_ned)
+                        dist_start = np.linalg.norm(q_start_ned - r_start_ned)
+                        dist_end = np.linalg.norm(q_end_ned - r_end_ned)
+                        max_allowed = self.config.relocalization_gps_max_pair_distance_m
+                        if dist_start > max_allowed or dist_end > max_allowed:
+                            print(f"GPS gating failed: start {dist_start:.2f}m, end {dist_end:.2f}m exceed {max_allowed}m.")
+                            return []
+            except Exception as e:
+                print(f"Warning: GPS gating failed due to error: {e}. Proceeding without GPS gate.")
+
+        # Trim internal buffers to reduce memory
+        self.frame_buffer = self.frame_buffer[q_start:q_end]
+        self.frame_pos_buffer = self.frame_pos_buffer[q_start:q_end]
+        self.frametimes_ns = self.frametimes_ns[q_start:q_end]
+        self.place_net_descriptors = self.place_net_descriptors[q_start:q_end]
+        print(f"Query buffers trimmed to {len(self.frame_buffer)} frames.")
+
+        # Build identifiers for the trimmed frames
+        selected_query_paths = [f"frame_{i}" for i in range(len(self.frame_buffer))]
+        print(f"Selected {len(selected_query_paths)} query frames for localization.")
+        return selected_query_paths
 
     def _preprocess_views(self, views):
         """Preprocesses the views for the MapAnything model."""
@@ -394,13 +455,12 @@ class VisualSLAM:
             processed_image_paths = processed_image_paths[::self.config.stride]
             print(f"Processing {len(self.frame_buffer)} frames from video. With stride={self.config.stride}, processing {len(processed_image_paths)} frames.")
         else:
-            all_image_paths = natsorted([os.path.join(self.config.image_folder, f) for f in os.listdir(self.config.image_folder) if f.endswith(('.jpg', '.png', '.JPG', '.PNG'))])
-            processed_image_paths = all_image_paths[::self.config.stride]
-            print(f"Found {len(all_image_paths)} total images. Processing {len(processed_image_paths)} with stride={self.config.stride}.")
+            raise ValueError("Video-only mode: image list input is not supported.")
 
         if len(processed_image_paths) < 2: return
 
         self.last_chunk_poses_for_fallback = {} # Used for sequential fallback
+        self.last_chunk_depth_z_for_fallback = {} # Depth maps for overlap priors
         database = []
 
         chunk_step = self.config.chunk_size - self.config.overlap_size
@@ -418,7 +478,7 @@ class VisualSLAM:
             if relocalization_db:
                 view_set, paths_in_view_set, first_overlap_pose, place_vectors_for_chunk = self._prepare_relocalization_views(current_chunk_paths, relocalization_db)
             else:
-                view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback)
+                view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback, self.last_chunk_depth_z_for_fallback)
 
             if not view_set or len(view_set) < 2:
                 print("Not enough views in chunk to process.")
@@ -495,15 +555,6 @@ class VisualSLAM:
             except Exception as e:
                 print(f"Chunk {i}: Could not estimate ground plane, will use fallback. {e}")
 
-            # Get place vectors if they weren't pre-calculated
-            if place_vectors_for_chunk is None:
-                place_vectors = []
-                for view in view_set: 
-                    img = rgb(view['img'], view['data_norm_type'][0])[0]*255
-                    vector = torch.tensor(self.place_net(img).squeeze())
-                    place_vectors.append(vector)
-                place_vectors_for_chunk = torch.stack(place_vectors)
-
             # Save chunk data and update database
             all_normals_for_chunk = [ground_normal] * len(query_predictions) if ground_normal is not None else [None] * len(query_predictions)
             all_plane_ds_for_chunk = [plane_d] * len(query_predictions) if plane_d is not None else [None] * len(query_predictions)
@@ -514,9 +565,18 @@ class VisualSLAM:
             database.extend(processed_chunk_data)
 
             # --- Update Last Chunk Poses for Next Overlap ---
+            # Use original query paths as keys to preserve overlap identity across chunks
             self.last_chunk_poses_for_fallback.clear()
-            for entry in processed_chunk_data:
-                self.last_chunk_poses_for_fallback[entry["image_path"]] = entry["camera_pose"]
+            self.last_chunk_depth_z_for_fallback.clear()
+            for idx, entry in enumerate(processed_chunk_data):
+                if idx < len(query_paths):
+                    key = query_paths[idx]
+                else:
+                    key = entry["image_path"]
+                self.last_chunk_poses_for_fallback[key] = entry["camera_poses"]
+                if "depth_z" in entry:
+                    self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
+                self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
                 
             if self.config.create_debug_chunk_visualizations:
                 self._save_debug_chunk_visualization(i, query_predictions)
@@ -525,48 +585,48 @@ class VisualSLAM:
         
         # --- Final Alignment and Database Save ---
         alignment_transform = None
-        if self.telemetry and self.gravity is not None:
-            # 1. Align to Gravity
-            gravity_transform = self._align_reconstruction_to_gravity(database)
-            
-            if gravity_transform is not None:
-                # Create a temporary database aligned to gravity for subsequent alignments
-                db_grav_aligned = [{'camera_pose': gravity_transform.cpu() @ entry['camera_pose'], 'image_path': entry['image_path']} for entry in database]
+        if relocalization_db is None:
+            # Only run GPS/gravity alignment for standalone query reconstructions.
+            if self.telemetry and self.gravity is not None:
+                # 1. Align to Gravity
+                gravity_transform = self._align_reconstruction_to_gravity(database)
+                
+                if gravity_transform is not None:
+                    # Create a temporary database aligned to gravity for subsequent alignments
+                    db_grav_aligned = [{'camera_poses': gravity_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in database]
 
-                # 2. Align to GPS direction in the XY plane (zero_z=True)
-                gps_xy_transform = self._align_reconstruction_to_gps_direction(db_grav_aligned, zero_z=True)
+                    # 2. Align to GPS direction in the XY plane (zero_z=True)
+                    gps_xy_transform = self._align_reconstruction_to_gps_direction(db_grav_aligned, zero_z=True)
 
-                if gps_xy_transform is not None:
-                    # Combine gravity and XY alignment
-                    alignment_transform = gps_xy_transform @ gravity_transform
-                    
-                    # Create a temporary database also aligned in the XY plane for the final step
-                    db_xy_aligned = [{'camera_pose': gps_xy_transform.cpu() @ entry['camera_pose'], 'image_path': entry['image_path']} for entry in db_grav_aligned]
+                    if gps_xy_transform is not None:
+                        # Combine gravity and XY alignment
+                        alignment_transform = gps_xy_transform @ gravity_transform
+                        
+                        # Create a temporary database also aligned in the XY plane for the final step
+                        db_xy_aligned = [{'camera_poses': gps_xy_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in db_grav_aligned]
 
-                    # 3. Perform final full 3D alignment (zero_z=False)
-                    final_gps_transform = self._align_reconstruction_to_gps_direction(db_xy_aligned, zero_z=False)
+                        # 3. Perform final full 3D alignment (zero_z=False)
+                        final_gps_transform = self._align_reconstruction_to_gps_direction(db_xy_aligned, zero_z=False)
 
-                    if final_gps_transform is not None:
-                        # Combine all transforms: T_final = T_gps_full @ T_gps_xy @ T_gravity
-                        alignment_transform = final_gps_transform @ alignment_transform
-                else:
-                    # Fallback to just gravity alignment if GPS XY fails
-                    alignment_transform = gravity_transform
-        else:
-            # Fallback for sequences without telemetry
-            print("No telemetry or gravity data available, attempting simple GPS direction alignment.")
-            alignment_transform = self._align_reconstruction_to_gps_direction(database, zero_z=True)
+                        if final_gps_transform is not None:
+                            # Combine all transforms: T_final = T_gps_full @ T_gps_xy @ T_gravity
+                            alignment_transform = final_gps_transform @ alignment_transform
+                    else:
+                        # Fallback to just gravity alignment if GPS XY fails
+                        alignment_transform = gravity_transform
+            else:
+                # Fallback for sequences without telemetry
+                print("No telemetry or gravity data available, attempting simple GPS direction alignment.")
+                alignment_transform = self._align_reconstruction_to_gps_direction(database, zero_z=True)
 
         self._save_database(database, alignment_transform)
         
-        if alignment_transform is not None:
+        if relocalization_db is None and alignment_transform is not None:
             # Save the final transform for the point cloud processor and align chunks
             alignment_path = os.path.join(os.path.dirname(self.config.database_path), "alignment.pt")
             torch.save(alignment_transform, alignment_path)
             print(f"Saved final alignment transform to {alignment_path}")
             self._save_chunks_for_visualization(database, alignment_transform)
-        else:
-            print("Warning: Final alignment transform could not be computed. Chunks will not be aligned.")
 
 
         print("\n--- Total Execution Summary ---")
@@ -576,6 +636,7 @@ class VisualSLAM:
         self,
         current_chunk_paths: List[str],
         last_chunk_poses: Dict[str, torch.Tensor],
+        last_chunk_depth_z: Dict[str, torch.Tensor],
     ) -> Tuple[List[Dict], List[str], torch.Tensor]:
         """Prepares the view_set for a standard sequential chunk."""
         
@@ -589,23 +650,17 @@ class VisualSLAM:
             overlap_paths = [path for path in current_chunk_paths if path in last_chunk_poses]
             if overlap_paths:
                 print(f"Found {len(overlap_paths)} overlapping views from previous chunk to use as priors.")
-                # Load the images for the overlapping views
-                if self.config.video_path:
-                    overlap_views = self._get_views_from_buffer(overlap_paths)
-                else:
-                    overlap_views = load_images(
-                        overlap_paths, 
-                        resize_mode="fixed_size", 
-                        size=self.target_size,
-                        crop_bottom_percent=self.config.crop_bottom_percent
-                    )
+                # Load overlap views from video buffer (video-only)
+                overlap_views = self._get_views_from_buffer(overlap_paths)
                 for i, view in enumerate(overlap_views):
                     path = overlap_paths[i]
                     pose = last_chunk_poses[path]
+                    depth_z = last_chunk_depth_z[path]
                     view.update({
                         "camera_poses": pose,
                         "intrinsics": self.intrinsics,
-                        "is_metric_scale": torch.tensor([True], device=self.device)
+                        "is_metric_scale": torch.tensor([True], device=self.device),
+                        "depth_z": depth_z
                     })
                 view_set.extend(overlap_views)
                 paths_in_view_set.extend(overlap_paths)
@@ -613,22 +668,9 @@ class VisualSLAM:
         
         # 2. Add all new (unposed) views from the current chunk
         new_paths = [path for path in current_chunk_paths if path not in paths_in_view_set]
-        if self.config.video_path:
-            new_views = self._get_views_from_buffer(new_paths)
-        else:
-            new_views = load_images(
-                new_paths, 
-                resize_mode="fixed_size", 
-                size=self.target_size,
-                crop_bottom_percent=self.config.crop_bottom_percent
-            )
+        new_views = self._get_views_from_buffer(new_paths)
         for view in new_views:
             view["intrinsics"] = self.intrinsics
-            
-            # --- Add Place Recognition Vector ---
-            img_for_place_net = rgb(view['img'], view['data_norm_type'][0])[0] * 255
-            place_vector = self.place_net(img_for_place_net)
-            view["place_net_descriptor"] = torch.from_numpy(place_vector).squeeze()
 
         view_set.extend(new_views)
         paths_in_view_set.extend(new_paths)
@@ -653,15 +695,25 @@ class VisualSLAM:
                 current_chunk_paths, 
                 resize_mode="fixed_size", 
                 size=self.target_size,
-                crop_bottom_percent=self.config.crop_bottom_percent
             )
         
-        current_vectors = []
-        for view in current_views:
-            img_for_place_net = rgb(view['img'], view['data_norm_type'][0])[0] * 255
-            vector = torch.tensor(self.place_net(img_for_place_net).squeeze())
-            current_vectors.append(vector.squeeze())
-        current_vectors = torch.stack(current_vectors)
+        # Reuse precomputed place vectors for video; compute only for image lists
+        if self.config.video_path:
+            current_vectors = []
+            for path in current_chunk_paths:
+                base = os.path.basename(path)
+                name, _sep, _ext = base.partition('.')
+                digits = ''.join([c for c in name if c.isdigit()])
+                frame_idx = int(digits)
+                current_vectors.append(torch.from_numpy(self.place_net_descriptors[frame_idx]).squeeze())
+            current_vectors = torch.stack(current_vectors)
+        else:
+            current_vectors = []
+            for view in current_views:
+                img_for_place_net = rgb(view['img'], view['data_norm_type'][0])[0] * 255
+                vector = torch.tensor(self.place_net(img_for_place_net).squeeze())
+                current_vectors.append(vector.squeeze())
+            current_vectors = torch.stack(current_vectors)
 
         # 2. Find best matches in the database using L2 distance
         similarities = torch.cdist(current_vectors, reference_vectors.cpu())
@@ -670,6 +722,7 @@ class VisualSLAM:
         
         # 3. Filter matches based on thresholds
         min_distance = best_match_distances.min() 
+        print("Min distance:", min_distance)
         relative_threshold = min_distance * (1 + self.config.relocalization_threshold_percent / 100)
         absolute_threshold = self.config.max_relocalization_threshold
         
@@ -698,7 +751,7 @@ class VisualSLAM:
                 if db_idx not in added_db_indices:
                     db_entry = reference_db[db_idx]
                     db_image_path = db_entry['image_path']
-                    db_pose = db_entry['camera_pose'].to(self.device)
+                    db_pose = db_entry['camera_poses'].to(self.device)
                     
                     if self.config.video_path:
                         # This part is tricky, relocalization with video requires a way to map db paths to frames
@@ -707,7 +760,16 @@ class VisualSLAM:
                         print(f"Warning: Relocalization from a video sequence against a database with file paths ({db_image_path}).")
                     
                     db_view = load_images([db_image_path], resize_mode="fixed_size", size=self.target_size)[0]
-                    db_view.update({"intrinsics": self.intrinsics, "camera_poses": db_pose})
+                    # Prefer stored intrinsics from the reference DB if present
+                    ref_intrinsics = db_entry.get('intrinsics', None)
+                    if ref_intrinsics is not None:
+                        if isinstance(ref_intrinsics, torch.Tensor):
+                            intr = ref_intrinsics
+                        else:
+                            intr = torch.tensor(ref_intrinsics, dtype=torch.float32)
+                    else:
+                        intr = self.intrinsics
+                    db_view.update({"intrinsics": intr, "camera_poses": db_pose})
                     
                     if first_overlap_pose is None:
                         first_overlap_pose = db_pose
@@ -723,7 +785,7 @@ class VisualSLAM:
         else:
             print("No valid relocalization matches found for this chunk. Proceeding with sequential alignment.")
             # Fallback to sequential alignment if no matches are found
-            view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback)
+            view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback, self.last_chunk_depth_z_for_fallback)
             return view_set, paths_in_view_set, first_overlap_pose, current_vectors
             
         # If no valid matches are found, we'll try to align sequentially
@@ -743,21 +805,16 @@ class VisualSLAM:
 
         if overlapping_sequential_paths:
             print(f"Adding {len(overlapping_sequential_paths)} sequential views from previous query chunk as priors.")
-            if self.config.video_path:
-                overlap_views = self._get_views_from_buffer(overlapping_sequential_paths)
-            else:
-                overlap_views = load_images(
-                    overlapping_sequential_paths,
-                    resize_mode="fixed_size",
-                    size=self.target_size,
-                    crop_bottom_percent=self.config.crop_bottom_percent
-                )
+            overlap_views = self._get_views_from_buffer(overlapping_sequential_paths)
             for i, view in enumerate(overlap_views):
                 path = overlapping_sequential_paths[i]
                 pose = self.last_chunk_poses_for_fallback[path]
+                depth_z = self.last_chunk_depth_z_for_fallback[path]
                 view.update({
-                    "camera_poses": pose, "intrinsics": self.intrinsics,
-                    "is_metric_scale": torch.tensor([True], device=self.device)
+                    "camera_poses": pose, 
+                    "intrinsics": self.intrinsics,
+                    "is_metric_scale": torch.tensor([True], device=self.device),
+                    "depth_z": depth_z
                 })
             view_set.extend(overlap_views)
             paths_in_view_set.extend(overlapping_sequential_paths)
@@ -796,19 +853,19 @@ class VisualSLAM:
         for entry in database:
             path = entry['image_path']
             try:
-                frame_idx_str = path.split('_')[-1]
-                frame_idx = int(frame_idx_str)
-                
-                # Find the original index in the strided list to map back to the full buffer
-                # This logic seems a bit complex, let's simplify by using the frame_pos_buffer
-                if frame_idx >= len(self.frametimes_ns): continue
+                base = os.path.basename(path)
+                name, _sep, _ext = base.partition('.')
+                digits = ''.join([c for c in name if c.isdigit()])
+                frame_idx = int(digits)
+                if frame_idx >= len(self.frametimes_ns):
+                    continue
                 tns = self.frametimes_ns[frame_idx]
 
                 if tns in self.gravity:
                     g_c = np.array(self.gravity[tns])
                     
                     # Pose is T_w_c
-                    T_w_c = entry['camera_pose'].to(self.device)
+                    T_w_c = entry['camera_poses'].to(self.device)
                     
                     # We need R_c_w for the rotation
                     T_c_w = torch.linalg.inv(T_w_c)
@@ -863,8 +920,14 @@ class VisualSLAM:
             start_path = start_entry['image_path']
             end_path = end_entry['image_path']
 
-            start_idx = int(start_path.split('_')[-1])
-            end_idx = int(end_path.split('_')[-1])
+            def _idx_from_path(p):
+                base = os.path.basename(p)
+                name, _sep, _ext = base.partition('.')
+                digits = ''.join([c for c in name if c.isdigit()])
+                return int(digits)
+
+            start_idx = _idx_from_path(start_path)
+            end_idx = _idx_from_path(end_path)
 
             start_tns = self.frametimes_ns[start_idx]
             end_tns = self.frametimes_ns[end_idx]
@@ -878,8 +941,8 @@ class VisualSLAM:
             gps_end = np.array(self.gps_ned[end_tns])
 
             # Get SLAM camera positions (already gravity-aligned)
-            cam_pose_start = start_entry['camera_pose'][0].cpu().numpy()
-            cam_pose_end = end_entry['camera_pose'][0].cpu().numpy()
+            cam_pose_start = start_entry['camera_poses'][0].cpu().numpy()
+            cam_pose_end = end_entry['camera_poses'][0].cpu().numpy()
             cam_position_start = cam_pose_start[:3, 3]
             cam_position_end = cam_pose_end[:3, 3]
 
@@ -971,15 +1034,19 @@ class VisualSLAM:
             if not path:
                 continue
             try:
-                frame_idx = int(path.split('_')[-1])
-                if frame_idx >= len(self.frametimes_ns): continue
+                base = os.path.basename(path)
+                name, _sep, _ext = base.partition('.')
+                digits = ''.join([c for c in name if c.isdigit()])
+                frame_idx = int(digits)
+                if frame_idx >= len(self.frametimes_ns):
+                    continue
                 tns = self.frametimes_ns[frame_idx]
 
                 if tns in self.gravity:
                     g_c_measured = np.array(self.gravity[tns])
 
                     # Final aligned pose T_w_c
-                    T_w_c = entry['camera_pose'].cpu().numpy()
+                    T_w_c = entry['camera_poses'].cpu().numpy()
                     R_w_c = T_w_c[0, :3, :3]
 
                     g_c_aligned = R_w_c.T @ grav_dir_w_target
@@ -999,9 +1066,13 @@ class VisualSLAM:
         """Constructs view dictionaries from the frame buffer for a list of frame identifiers."""
         views = []
         for path in paths:
-            frame_idx_str = path.split('_')[-1]
             try:
-                frame_idx = int(frame_idx_str)
+                # Paths are of the form 'frame_{idx}' or may point to saved files; handle both robustly
+                base = os.path.basename(path)
+                name, _sep, _ext = base.partition('.')
+                # Expect prefix 'frame_'; extract trailing digits
+                digits = ''.join([c for c in name if c.isdigit()])
+                frame_idx = int(digits)
                 img_tensor = self.frame_buffer[frame_idx]
                 place_net_descriptor = self.place_net_descriptors[frame_idx]
                 
@@ -1030,15 +1101,68 @@ class VisualSLAM:
     def _process_chunk_and_update_db(self, predictions, paths, ground_normal, plane_d, place_vectors):
         """Processes predictions and updates the database list."""
         processed_data = []
+        # Ensure a persistent images directory exists next to the database to store RGB frames
+        images_dir = None
+        try:
+            if self.config.database_path:
+                images_dir = os.path.join(os.path.dirname(self.config.database_path), "reference_images")
+                os.makedirs(images_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not create images directory for database frames: {e}")
         for i, pred in enumerate(predictions):
             entry = {
-                "camera_pose": pred['camera_poses'].cpu(),
+                "camera_poses": pred['camera_poses'].cpu(),
                 "image_path": paths[i],
                 "ground_normal": ground_normal.cpu() if ground_normal is not None else None,
                 "plane_d": plane_d.cpu() if plane_d is not None else None,
+                "depth_z": pred['depth_z'].cpu(),
+                "intrinsics": self.intrinsics.detach().cpu() if isinstance(self.intrinsics, torch.Tensor) else torch.tensor(self.intrinsics, dtype=torch.float32)
             }
             if place_vectors is not None and i < len(place_vectors):
                 entry["place_net_descriptor"] = place_vectors[i].cpu()
+            # Attach GPS NED to database if available (per frame)
+            try:
+                if hasattr(self, 'gps_ned') and self.gps_ned is not None and self.config.video_path:
+                    base = os.path.basename(paths[i])
+                    name, _sep, _ext = base.partition('.')
+                    digits = ''.join([c for c in name if c.isdigit()])
+                    frame_idx = int(digits)
+                    if frame_idx < len(self.frametimes_ns):
+                        tns = self.frametimes_ns[frame_idx]
+                        if tns in self.gps_ned:
+                            entry["gps_ned"] = torch.tensor(self.gps_ned[tns], dtype=torch.float32)
+            except Exception as e:
+                print(f"Warning: Could not attach GPS NED for {paths[i]}: {e}")
+            # Persist the RGB frame used for reconstruction and repoint image_path to it
+            try:
+                if images_dir is not None and 'img_no_norm' in pred:
+                    # Derive a stable filename from the original path identifier
+                    base = os.path.basename(paths[i])
+                    name, _sep, _ext = base.partition('.')
+                    if not name:
+                        name = base
+                    filename = f"{name}.jpg"
+                    save_path = os.path.join(images_dir, filename)
+
+                    # Convert denormalized image [0,1] (H,W,3) to uint8 RGB
+                    img = pred['img_no_norm']
+                    if isinstance(img, torch.Tensor):
+                        # Expect shape (B, H, W, 3) with B=1
+                        if img.ndim == 4:
+                            img = img[0]
+                        img_np = img.detach().cpu().numpy()
+                    else:
+                        img_np = np.array(img)
+                    img_uint8 = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
+
+                    # Write as JPEG (convert RGB->BGR for OpenCV)
+                    if not os.path.exists(save_path):
+                        cv2.imwrite(save_path, cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR))
+
+                    # Update entry to point to the saved RGB frame
+                    entry["image_path"] = save_path
+            except Exception as e:
+                print(f"Warning: Failed to save/reference RGB frame for database entry {paths[i]}: {e}")
             
             processed_data.append(entry)
         return processed_data
@@ -1051,9 +1175,9 @@ class VisualSLAM:
         if alignment_transform is not None:
             print("Applying final GPS alignment to the database...")
             for entry in database:
-                original_pose = entry['camera_pose']
+                original_pose = entry['camera_poses']
                 aligned_pose = alignment_transform.to(original_pose.device) @ original_pose
-                entry['camera_pose'] = aligned_pose
+                entry['camera_poses'] = aligned_pose
         
         # --- Prepare data for saving ---
         # Separate place vectors from the main database if they exist
@@ -1230,7 +1354,10 @@ class VisualSLAM:
             # We extract the index from the identifier to get the real metadata.
             for path in paths_to_save:
                 try:
-                    frame_idx = int(path.split('_')[-1])
+                    base = os.path.basename(path)
+                    name, _sep, _ext = base.partition('.')
+                    digits = ''.join([c for c in name if c.isdigit()])
+                    frame_idx = int(digits)
                     original_list_idx = all_processed_paths.index(path)
                     frametimes_ns_to_save.append(self.frametimes_ns[original_list_idx])
                     frame_pos_to_save.append(self.frame_pos_buffer[original_list_idx])

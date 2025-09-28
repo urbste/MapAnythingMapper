@@ -74,7 +74,7 @@ if __name__ == "__main__":
 
     # --- Sequence Control ---
     parser.add_argument("--start_frame", type=int, default=200, help="Start frame for video processing.")
-    parser.add_argument("--max_frames", type=int, default=-1, help="Maximum number of frames to process (-1 for all).")
+    parser.add_argument("--max_frames", type=int, default=1000, help="Maximum number of frames to process (-1 for all).")
     parser.add_argument("--stride", type=int, default=2, help="Process every Nth frame.")
 
     # --- SLAM Parameters ---

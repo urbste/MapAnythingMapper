@@ -159,7 +159,6 @@ def load_images(
     bayer_format=False,
     resolution_set=518,
     stride=1,
-    crop_bottom_percent=0.0,
 ):
     """
     Open and convert all images in a list or folder to proper input format for model
@@ -252,12 +251,6 @@ def load_images(
                 img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert(
                     "RGB"
                 )
-
-            # --- Apply bottom crop if specified ---
-            if crop_bottom_percent > 0:
-                w, h = img.size
-                crop_pixels = int(h * crop_bottom_percent / 100.0)
-                img = img.crop((0, 0, w, h - crop_pixels))
 
             W1, H1 = img.size
             aspect_ratios.append(W1 / H1)
