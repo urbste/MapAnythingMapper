@@ -382,6 +382,18 @@ class VisualSLAM:
             start_query_frame_idx, end_query_frame_idx = end_query_frame_idx, start_query_frame_idx
         print(f"Best query frame indices: start={start_query_frame_idx}, end={end_query_frame_idx}")
 
+        # Save debug preview of the matched start/end pairs (query vs. reference)
+        try:
+            if getattr(self.config, 'create_debug_matches', False):
+                reference_db, _reference_vectors = self._unpack_reference_db(db_data)
+                self._save_localization_start_end_debug(
+                    reference_db,
+                    start_query_frame_idx,
+                    end_query_frame_idx,
+                )
+        except Exception as e:
+            print(f"Warning: Could not save start/end relocalization debug previews: {e}")
+
         # 4. Add buffer around start/end and trim buffers
         overlap = self.config.relocalization_frame_overlap
         q_start = max(0, start_query_frame_idx - overlap)
@@ -621,6 +633,12 @@ class VisualSLAM:
 
         self._save_database(database, alignment_transform)
         
+        # Always save a trajectory-only PLY for the query reconstruction
+        try:
+            self._save_query_trajectory_and_normals(database)
+        except Exception as e:
+            print(f"Warning: Could not save trajectory/normals PLY: {e}")
+
         if relocalization_db is None and alignment_transform is not None:
             # Save the final transform for the point cloud processor and align chunks
             alignment_path = os.path.join(os.path.dirname(self.config.database_path), "alignment.pt")
@@ -780,8 +798,8 @@ class VisualSLAM:
                     
                     # Create debug image for the selected priors
                     if self.config.create_debug_matches:
-                        query_image_path = current_chunk_paths[query_idx]
-                        create_debug_match_image(self.chunk_idx_for_debug, query_idx, query_image_path, db_image_path)
+                        query_image_id = current_chunk_paths[query_idx]
+                        self._save_query_db_match_debug(self.chunk_idx_for_debug, query_idx, query_image_id, db_image_path)
         else:
             print("No valid relocalization matches found for this chunk. Proceeding with sequential alignment.")
             # Fallback to sequential alignment if no matches are found
@@ -1097,6 +1115,98 @@ class VisualSLAM:
             transformed_pts = (transform.squeeze() @ pts3d_hom.T).T
             pred['pts3d'] = transformed_pts[:, :3].view(pred['pts3d'].shape)
         return predictions
+
+    def _frame_tensor_to_bgr_image(self, img_tensor: torch.Tensor) -> np.ndarray:
+        """Convert a normalized CHW tensor (dinov2 normalization) to uint8 BGR image for OpenCV."""
+        if img_tensor is None:
+            raise ValueError("Empty image tensor in frame buffer.")
+        img = img_tensor.detach().cpu()
+        if img.ndim == 4:
+            img = img[0]
+        # Denormalize using dinov2 stats
+        img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
+        mean = torch.tensor(img_norm.mean).view(3, 1, 1)
+        std = torch.tensor(img_norm.std).view(3, 1, 1)
+        img = (img * std + mean).clamp(0.0, 1.0)
+        img = (img * 255.0).byte().permute(1, 2, 0).numpy()  # HWC, RGB
+        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        return bgr
+
+    def _save_localization_start_end_debug(self, reference_db: List[Dict], start_query_frame_idx: int, end_query_frame_idx: int):
+        """
+        Save side-by-side debug images showing (query start vs reference start) and
+        (query end vs reference end) used for sequence selection.
+        """
+        if not reference_db or 'image_path' not in reference_db[0] or 'image_path' not in reference_db[-1]:
+            print("Debug preview skipped: reference DB missing image paths.")
+            return
+
+        out_dir = os.path.join(os.path.dirname(self.config.database_path), "debug_matches")
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Build query images from the cached video buffer
+        query_start_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[start_query_frame_idx])
+        query_end_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[end_query_frame_idx])
+
+        # Load reference endpoints
+        ref_start_bgr = cv2.imread(reference_db[0]['image_path'])
+        ref_end_bgr = cv2.imread(reference_db[-1]['image_path'])
+        if ref_start_bgr is None or ref_end_bgr is None:
+            print("Debug preview skipped: could not load reference endpoint images.")
+            return
+
+        def _stack_h(img_left, img_right, target_h=240):
+            def _resize_h(img, h):
+                ih, iw = img.shape[:2]
+                w = int(iw * (h / ih))
+                return cv2.resize(img, (w, h))
+            l = _resize_h(img_left, target_h)
+            r = _resize_h(img_right, target_h)
+            return cv2.hconcat([l, r])
+
+        start_pair = _stack_h(query_start_bgr, ref_start_bgr)
+        end_pair = _stack_h(query_end_bgr, ref_end_bgr)
+
+        start_path = os.path.join(out_dir, f"localization_start_pair_q{start_query_frame_idx:06d}.jpg")
+        end_path = os.path.join(out_dir, f"localization_end_pair_q{end_query_frame_idx:06d}.jpg")
+
+        cv2.imwrite(start_path, start_pair)
+        cv2.imwrite(end_path, end_pair)
+        print(f"Saved relocalization start/end previews to:\n  {start_path}\n  {end_path}")
+
+    def _save_query_db_match_debug(self, chunk_idx: int, query_image_idx_in_chunk: int, query_image_identifier: str, db_image_path: str):
+        """Save a side-by-side preview of a query frame (from buffer) and its matched DB image."""
+        try:
+            # Extract frame index from identifiers like 'frame_123'
+            base = os.path.basename(query_image_identifier)
+            name, _sep, _ext = base.partition('.')
+            digits = ''.join([c for c in name if c.isdigit()])
+            frame_idx = int(digits)
+
+            query_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[frame_idx])
+            ref_bgr = cv2.imread(db_image_path)
+            if ref_bgr is None:
+                print(f"Warning: Could not read reference image at {db_image_path} for debug match.")
+                return
+
+            # Resize and stack
+            target_h = 240
+            def _resize_h(img, h):
+                ih, iw = img.shape[:2]
+                w = int(iw * (h / ih))
+                return cv2.resize(img, (w, h))
+            q_res = _resize_h(query_bgr, target_h)
+            r_res = _resize_h(ref_bgr, target_h)
+            stacked = cv2.hconcat([q_res, r_res])
+
+            # Output path next to database
+            out_dir = os.path.join(os.path.dirname(self.config.database_path), "debug_matches")
+            os.makedirs(out_dir, exist_ok=True)
+            save_path = os.path.join(out_dir, f"chunk_{chunk_idx:04d}_match_q{frame_idx:06d}_idx{query_image_idx_in_chunk:03d}.jpg")
+            cv2.imwrite(save_path, stacked)
+            print(f"Saved relocalization match preview to {save_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save relocalization match preview: {e}")
 
     def _process_chunk_and_update_db(self, predictions, paths, ground_normal, plane_d, place_vectors):
         """Processes predictions and updates the database list."""
@@ -1458,3 +1568,95 @@ class VisualSLAM:
         o3d.io.write_point_cloud(traj_path, traj_pcd)
 
         print(f"Saved debug visualization for chunk {chunk_idx} to {debug_dir}")
+
+    def _save_query_trajectory_and_normals(self, database: List[Dict]):
+        """
+        Save a trajectory-only PLY for the current run and an auxiliary normals PLY.
+        Trajectory is saved as a dense point cloud along the camera path for viewer compatibility.
+        Normals are visualized as short colored line segments sampled into points and saved as PLY.
+        """
+        if not database:
+            print("No database entries to save trajectory.")
+            return
+
+        try:
+            # Extract camera positions and optional normals
+            camera_positions = []
+            per_frame_normals = []
+            for entry in database:
+                pose = entry['camera_poses']
+                if isinstance(pose, torch.Tensor):
+                    pose_np = pose[0].detach().cpu().numpy()
+                else:
+                    pose_np = pose[0]
+                camera_positions.append(pose_np[:3, 3])
+                nrm = entry.get('ground_normal', None)
+                if isinstance(nrm, torch.Tensor):
+                    nrm = nrm.detach().cpu().numpy()
+                per_frame_normals.append(nrm)
+
+            if len(camera_positions) < 2:
+                print("Not enough poses to form a trajectory.")
+                return
+
+            # Determine normal line length from median step size
+            steps = [np.linalg.norm(camera_positions[i+1] - camera_positions[i]) for i in range(len(camera_positions)-1)]
+            median_step = np.median(steps) if steps else 1.0
+            normal_length = float(max(0.25 * median_step, 0.1))
+
+            # Build dense point cloud along the trajectory lines
+            num_points_per_segment = 100
+            traj_pts = []
+            traj_cols = []
+            traj_color = np.array([0.0, 0.0, 1.0])
+            for i in range(len(camera_positions) - 1):
+                start = camera_positions[i]
+                end = camera_positions[i + 1]
+                seg_points = np.linspace(start, end, num_points_per_segment)
+                seg_colors = np.tile(traj_color, (num_points_per_segment, 1))
+                traj_pts.append(seg_points)
+                traj_cols.append(seg_colors)
+
+            if not traj_pts:
+                print("No segments to save for trajectory.")
+                return
+
+            traj_pts = np.concatenate(traj_pts, axis=0)
+            traj_cols = np.concatenate(traj_cols, axis=0)
+
+            # Build dense points for normals (optional)
+            normal_pts = []
+            normal_cols = []
+            normal_color = np.array([0.0, 1.0, 0.0])
+            for i, pos in enumerate(camera_positions):
+                nrm = per_frame_normals[i] if i < len(per_frame_normals) else None
+                if nrm is None:
+                    continue
+                end = pos + nrm * normal_length
+                seg_points = np.linspace(pos, end, 20)
+                seg_colors = np.tile(normal_color, (seg_points.shape[0], 1))
+                normal_pts.append(seg_points)
+                normal_cols.append(seg_colors)
+
+            # Save PLYs next to the database
+            out_dir = os.path.dirname(self.config.database_path) if self.config.database_path else self.config.output_dir
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Trajectory
+            traj_pcd = o3d.geometry.PointCloud()
+            traj_pcd.points = o3d.utility.Vector3dVector(traj_pts)
+            traj_pcd.colors = o3d.utility.Vector3dVector(traj_cols)
+            traj_path = os.path.join(out_dir, "query_trajectory_only.ply")
+            o3d.io.write_point_cloud(traj_path, traj_pcd)
+            print(f"Saved trajectory-only PLY to {traj_path}")
+
+            # Normals (if any)
+            if normal_pts:
+                normals_pcd = o3d.geometry.PointCloud()
+                normals_pcd.points = o3d.utility.Vector3dVector(np.concatenate(normal_pts, axis=0))
+                normals_pcd.colors = o3d.utility.Vector3dVector(np.concatenate(normal_cols, axis=0))
+                normals_path = os.path.join(out_dir, "query_normals.ply")
+                o3d.io.write_point_cloud(normals_path, normals_pcd)
+                print(f"Saved normals PLY to {normals_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save trajectory/normals: {e}")

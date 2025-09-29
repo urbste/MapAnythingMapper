@@ -20,6 +20,7 @@ def main(args):
         chunk_size=args.chunk_size,
         overlap_size=args.overlap_size,
         stride=args.stride,
+        create_debug_matches=args.debug_matches,
         create_debug_chunk_visualizations=args.debug_viz,
         point_cloud_confidence_threshold=args.pcl_confidence,
     )
@@ -35,21 +36,21 @@ def main(args):
         processor = PointCloudProcessor()
         
         # --- Process and visualize the original reference map ---
-        pcd_ref, traj_ref = processor.generate_pcd_and_trajectory(
+        pcd_ref, traj_ref, normal_ref = processor.generate_pcd_and_trajectory(
             chunk_dirs=[args.ref_chunk_dir], 
             trajectory_color=[1, 0, 0], # Red for reference
             config=config # Config is mainly for PCL settings, can be reused
         )
         
         # --- Process and visualize the new localized map ---
-        pcd_loc, traj_loc = processor.generate_pcd_and_trajectory(
+        pcd_loc, traj_loc, normal_loc = processor.generate_pcd_and_trajectory(
             chunk_dirs=[config.output_dir], 
             trajectory_color=[0, 0, 1], # Blue for localized
             config=config
         )
         
         # --- Visualize both together ---
-        geometries = [g for g in [pcd_ref, traj_ref, pcd_loc, traj_loc] if g]
+        geometries = [g for g in [pcd_ref, traj_ref, normal_ref, pcd_loc, traj_loc, normal_loc] if g]
         if geometries:
             processor.visualize_geometries(geometries)
         else:
@@ -73,16 +74,17 @@ if __name__ == "__main__":
     parser.add_argument("--database_path", type=str, default="/home/steffen/Data/GPStrava/TAAWN_TEST_DATA/1/Query/run2/_slam_results/slam_database.pt", help="Path to save the new SLAM database for the localized sequence.")
 
     # --- Sequence Control ---
-    parser.add_argument("--start_frame", type=int, default=200, help="Start frame for video processing.")
-    parser.add_argument("--max_frames", type=int, default=1000, help="Maximum number of frames to process (-1 for all).")
+    parser.add_argument("--start_frame", type=int, default=600, help="Start frame for video processing.")
+    parser.add_argument("--max_frames", type=int, default=600, help="Maximum number of frames to process (-1 for all).")
     parser.add_argument("--stride", type=int, default=2, help="Process every Nth frame.")
 
     # --- SLAM Parameters ---
-    parser.add_argument("--chunk_size", type=int, default=50, help="Size of each processing chunk.")
+    parser.add_argument("--chunk_size", type=int, default=30, help="Size of each processing chunk.")
     parser.add_argument("--overlap_size", type=int, default=1, help="Number of overlapping frames between chunks.")
     parser.add_argument("--pcl_confidence", type=float, default=0.8, help="Confidence threshold for points in the point cloud.")
     
     # --- Visualization ---
+    parser.add_argument("--debug_matches", action='store_true', help="Save query/reference start/end preview images for relocalization.")
     parser.add_argument("--visualize", action='store_true', help="Enable post-processing and visualization of the combined results.")
     parser.add_argument("--debug_viz", action='store_true', help="Enable saving of debug visualizations for each chunk of the new sequence.")
 
