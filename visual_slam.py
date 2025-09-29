@@ -515,8 +515,6 @@ class VisualSLAM:
                 else:
                     key = entry["image_path"]
                 self.last_chunk_poses_for_fallback[key] = entry["camera_poses"]
-                if "depth_z" in entry:
-                    self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
                 self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
                 
             if self.config.create_debug_chunk_visualizations:
@@ -832,43 +830,7 @@ class VisualSLAM:
                 print(f"Warning: Could not align chunk {os.path.basename(chunk_dir)}: {e}")
         print("Finished aligning chunk files.")
 
-    def _get_up_vector_residuals(self, aligned_database: List[Dict]) -> float:
-        """Calculates the average angular residual between measured gravity and the world's up-vector after alignment."""
-        all_residuals_deg = []
-        grav_dir_w_target = np.array([0, 0, -1])
-
-        for entry in aligned_database:
-            path = entry.get('image_path')
-            if not path:
-                continue
-            try:
-                base = os.path.basename(path)
-                name, _sep, _ext = base.partition('.')
-                digits = ''.join([c for c in name if c.isdigit()])
-                frame_idx = int(digits)
-                if frame_idx >= len(self.frametimes_ns):
-                    continue
-                tns = self.frametimes_ns[frame_idx]
-
-                if tns in self.gravity:
-                    g_c_measured = np.array(self.gravity[tns])
-
-                    # Final aligned pose T_w_c
-                    T_w_c = entry['camera_poses'].cpu().numpy()
-                    R_w_c = T_w_c[0, :3, :3]
-
-                    g_c_aligned = R_w_c.T @ grav_dir_w_target
-
-                    # Calculate the difference in the z-component
-                    all_residuals_deg.append(np.sqrt((g_c_measured[2] - g_c_aligned[2])**2))
-
-            except (ValueError, KeyError, IndexError) as e:
-                continue
-
-        if not all_residuals_deg:
-            return -1.0
-
-        return np.mean(all_residuals_deg)
+    
 
     def _get_views_from_buffer(self, paths: List[str]) -> List[Dict]:
         """Constructs view dictionaries from the frame buffer for a list of frame identifiers."""
