@@ -1,14 +1,11 @@
 import torch
 import os
 import time
-from natsort import natsorted
 import cv2
 import numpy as np
 from typing import List, Dict, Tuple
 
-from utils.math import rot_between_vectors, get_z_zero_vec
 from mapanything.models import MapAnything
-from mapanything.utils.geometry import initialize_rotation_from_gravity
 from mapanything.utils.image import load_images, find_closest_aspect_ratio
 from place_net_trt import PlaceNetTRT
 from slam_config import SLAMConfig
@@ -21,61 +18,16 @@ from utils.telemetry_converter import TelemetryImporter
 from utils.undistortion import create_undistortion_maps_from_file
 from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_DICT
 import torchvision.transforms as tvf
-import pymap3d as pm
 from scipy.spatial.transform import Rotation as RS
 import glob
+from slam.debug_utils import save_localization_start_end_debug, save_query_db_match_debug
+from slam.trajectory_utils import save_query_trajectory_and_normals
+from slam.alignment_utils import align_reconstruction_to_gravity, align_reconstruction_to_gps_direction
+from slam.geo_utils import ecef_to_ned
+from utils.math import scale_intrinsics
+from slam.plane_utils import estimate_ground_plane
 
 MS_TO_NS = 1_000_000
-
-def ecef_to_ned(gps_ecef, llh0, interp_ftns):
-    ned_coords = {}
-    print(llh0)
-    lat0, lon0, h0 , _, _= llh0
-    for tns in interp_ftns:
-        if tns in gps_ecef:
-            x, y, z = gps_ecef[tns]
-            n, e, d = pm.ecef2ned(x, y, z, lat0, lon0, h0)
-            ned_coords[tns] = [n, e, d]
-    return ned_coords
-
-def scale_intrinsics(intrinsics, scale_factor_x, scale_factor_y):
-    scaled_intrinsics = intrinsics.clone()
-    scaled_intrinsics[0, 0] *= scale_factor_x
-    scaled_intrinsics[0, 2] *= scale_factor_x
-    scaled_intrinsics[1, 1] *= scale_factor_y
-    scaled_intrinsics[1, 2] *= scale_factor_y
-    return scaled_intrinsics.unsqueeze(0)
-
-def create_debug_match_image(chunk_idx, query_image_idx, query_image_path, reference_image_path, output_dir="debug_matches"):
-    """Creates and saves a debug image showing the query image and its database matches."""
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    query_img = cv2.imread(query_image_path)
-    if query_img is None: return
-
-    # Standard height for all images
-    h, w, _ = query_img.shape
-    target_h = 240
-    target_w = int(w * (target_h / h))
-    query_img_resized = cv2.resize(query_img, (target_w, target_h))
-    
-
-    match_img = cv2.imread(reference_image_path)
-    h, w, _ = match_img.shape
-    target_w = int(w * (target_h / h))
-    match_img_resized = cv2.resize(match_img, (target_w, target_h))
-    
-    # Add a red border to the query image to distinguish it
-    cv2.copyMakeBorder(query_img_resized, 2, 2, 2, 2, cv2.BORDER_CONSTANT, value=[0, 0, 255])
-    
-    # Combine images
-    combined_image = cv2.hconcat([query_img_resized, match_img_resized])
-    
-    # Save the image
-    save_path = os.path.join(output_dir, f"chunk_{chunk_idx}_matches_{query_image_idx}.jpg")
-    cv2.imwrite(save_path, combined_image)
-    print(f"Saved debug match image to {save_path}")
 
 class VisualSLAM:
     def __init__(self, config: SLAMConfig):
@@ -386,11 +338,7 @@ class VisualSLAM:
         try:
             if getattr(self.config, 'create_debug_matches', False):
                 reference_db, _reference_vectors = self._unpack_reference_db(db_data)
-                self._save_localization_start_end_debug(
-                    reference_db,
-                    start_query_frame_idx,
-                    end_query_frame_idx,
-                )
+                save_localization_start_end_debug(self.config.database_path, reference_db, self.frame_buffer, start_query_frame_idx, end_query_frame_idx)
         except Exception as e:
             print(f"Warning: Could not save start/end relocalization debug previews: {e}")
 
@@ -543,27 +491,8 @@ class VisualSLAM:
                     query_paths.append(path)
 
             # --- Estimate Ground Plane for the Chunk ---
-            ground_normal, plane_d = None, None
             try:
-                # Build a combined point cloud for plane estimation
-                if query_predictions:
-                    chunk_pcd_pts = torch.cat([p['pts3d'].reshape(-1, 3) for p in query_predictions], dim=0)
-                    chunk_pcd_masks = torch.cat([p['mask'].reshape(-1) for p in query_predictions], dim=0)
-                    chunk_pcd_pts = chunk_pcd_pts[chunk_pcd_masks]
-
-                    if chunk_pcd_pts.shape[0] > 1000: # Need enough points
-                        pcd = o3d.geometry.PointCloud()
-                        pcd.points = o3d.utility.Vector3dVector(chunk_pcd_pts.cpu().numpy())
-                        pcd = pcd.voxel_down_sample(voxel_size=0.1)
-                        
-                        plane_model, _ = pcd.segment_plane(distance_threshold=0.2, ransac_n=3, num_iterations=1000)
-                        a, b, c, d = plane_model
-                        normal = np.array([a, b, c])
-                        if normal[1] < 0: # Ensure normal points upwards (positive Y)
-                            normal = -normal
-                            d = -d
-                        ground_normal = torch.from_numpy(normal).float().to(self.device)
-                        plane_d = torch.tensor(d).float().to(self.device)
+                ground_normal, plane_d = estimate_ground_plane(query_predictions, distance_threshold=0.2, ransac_n=3, num_iterations=1000, device=self.device)
             except Exception as e:
                 print(f"Chunk {i}: Could not estimate ground plane, will use fallback. {e}")
 
@@ -601,14 +530,14 @@ class VisualSLAM:
             # Only run GPS/gravity alignment for standalone query reconstructions.
             if self.telemetry and self.gravity is not None:
                 # 1. Align to Gravity
-                gravity_transform = self._align_reconstruction_to_gravity(database)
+                gravity_transform = align_reconstruction_to_gravity(database, self.gravity, self.frametimes_ns, self.device)
                 
                 if gravity_transform is not None:
                     # Create a temporary database aligned to gravity for subsequent alignments
                     db_grav_aligned = [{'camera_poses': gravity_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in database]
 
                     # 2. Align to GPS direction in the XY plane (zero_z=True)
-                    gps_xy_transform = self._align_reconstruction_to_gps_direction(db_grav_aligned, zero_z=True)
+                    gps_xy_transform = align_reconstruction_to_gps_direction(db_grav_aligned, self.gps_ned, self.frametimes_ns, True, self.device)
 
                     if gps_xy_transform is not None:
                         # Combine gravity and XY alignment
@@ -618,7 +547,7 @@ class VisualSLAM:
                         db_xy_aligned = [{'camera_poses': gps_xy_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in db_grav_aligned]
 
                         # 3. Perform final full 3D alignment (zero_z=False)
-                        final_gps_transform = self._align_reconstruction_to_gps_direction(db_xy_aligned, zero_z=False)
+                        final_gps_transform = align_reconstruction_to_gps_direction(db_xy_aligned, self.gps_ned, self.frametimes_ns, False, self.device)
 
                         if final_gps_transform is not None:
                             # Combine all transforms: T_final = T_gps_full @ T_gps_xy @ T_gravity
@@ -629,13 +558,13 @@ class VisualSLAM:
             else:
                 # Fallback for sequences without telemetry
                 print("No telemetry or gravity data available, attempting simple GPS direction alignment.")
-                alignment_transform = self._align_reconstruction_to_gps_direction(database, zero_z=True)
+                alignment_transform = align_reconstruction_to_gps_direction(database, self.gps_ned, self.frametimes_ns, True, self.device)
 
         self._save_database(database, alignment_transform)
         
         # Always save a trajectory-only PLY for the query reconstruction
         try:
-            self._save_query_trajectory_and_normals(database)
+            save_query_trajectory_and_normals(database, self.config.database_path)
         except Exception as e:
             print(f"Warning: Could not save trajectory/normals PLY: {e}")
 
@@ -799,7 +728,8 @@ class VisualSLAM:
                     # Create debug image for the selected priors
                     if self.config.create_debug_matches:
                         query_image_id = current_chunk_paths[query_idx]
-                        self._save_query_db_match_debug(self.chunk_idx_for_debug, query_idx, query_image_id, db_image_path)
+                        save_query_db_match_debug(self.config.database_path, self.frame_buffer, 
+                            self.chunk_idx_for_debug, query_idx, query_image_id, db_image_path)
         else:
             print("No valid relocalization matches found for this chunk. Proceeding with sequential alignment.")
             # Fallback to sequential alignment if no matches are found
@@ -854,146 +784,6 @@ class VisualSLAM:
         paths_in_view_set.extend(new_query_paths)
             
         return view_set, paths_in_view_set, first_overlap_pose, current_vectors
-
-    def _align_reconstruction_to_gravity(self, database: List[Dict]) -> torch.Tensor:
-        """
-        Aligns the entire reconstruction to gravity using telemetry data.
-        Calculates the rotation required to align the average measured gravity vector with a Z-up world.
-        """
-        if not (self.telemetry and self.gravity and self.config.video_path):
-            print("Gravity alignment requires telemetry, gravity data, and video processing mode.")
-            return None
-
-        print("Aligning final reconstruction to gravity...")
-        grav_dir_w_target = np.array([0, 0, -1])  # Z-up
-        all_rotvecs = []
-
-        for entry in database:
-            path = entry['image_path']
-            try:
-                base = os.path.basename(path)
-                name, _sep, _ext = base.partition('.')
-                digits = ''.join([c for c in name if c.isdigit()])
-                frame_idx = int(digits)
-                if frame_idx >= len(self.frametimes_ns):
-                    continue
-                tns = self.frametimes_ns[frame_idx]
-
-                if tns in self.gravity:
-                    g_c = np.array(self.gravity[tns])
-                    
-                    # Pose is T_w_c
-                    T_w_c = entry['camera_poses'].to(self.device)
-                    
-                    # We need R_c_w for the rotation
-                    T_c_w = torch.linalg.inv(T_w_c)
-                    R_c_w = T_c_w[0, :3, :3].cpu().numpy()
-
-                    # Target gravity vector in camera coordinates
-                    g_target_c = R_c_w @ grav_dir_w_target
-
-                    # Find rotation that aligns measured gravity (g_c) to target gravity in camera frame (g_target_c)
-                    R_align_c, _ = Rotation.align_vectors(g_c, g_target_c)
-                    all_rotvecs.append(R_align_c.as_rotvec())
-
-            except (ValueError, KeyError, IndexError) as e:
-                print(f"Skipping gravity data for view {path}: {e}")
-                continue
-        
-        if not all_rotvecs:
-            print("Not enough valid gravity measurements to perform alignment.")
-            return None
-
-        # Average the rotation vectors to get the mean correction
-        mean_rotvec = np.mean(np.array(all_rotvecs), axis=0)
-        
-        # This is the final alignment rotation to apply to the world
-        R_align = Rotation.from_rotvec(mean_rotvec).as_matrix()
-
-        transform = torch.eye(4, device=self.device)
-        transform[:3, :3] = torch.linalg.inv(torch.from_numpy(R_align).float())
-        
-        return transform
-
-    def _align_reconstruction_to_gps_direction(self, database: List[Dict], zero_z: bool = False) -> torch.Tensor:
-        """
-        Aligns the reconstruction's XY direction with the GPS trajectory's direction.
-        This should be called *after* gravity alignment.
-        """
-        if not (self.telemetry and self.gps_ned):
-            print("GPS direction alignment requires telemetry with NED data.")
-            return None
-        
-        if len(database) < 2:
-            print("Not enough poses in the database for GPS direction alignment.")
-            return None
-            
-        print("Aligning final reconstruction to GPS direction...")
-
-        try:
-            # Get start and end poses and corresponding timestamps
-            start_entry = database[0]
-            end_entry = database[-1]
-
-            start_path = start_entry['image_path']
-            end_path = end_entry['image_path']
-
-            def _idx_from_path(p):
-                base = os.path.basename(p)
-                name, _sep, _ext = base.partition('.')
-                digits = ''.join([c for c in name if c.isdigit()])
-                return int(digits)
-
-            start_idx = _idx_from_path(start_path)
-            end_idx = _idx_from_path(end_path)
-
-            start_tns = self.frametimes_ns[start_idx]
-            end_tns = self.frametimes_ns[end_idx]
-
-            if start_tns not in self.gps_ned or end_tns not in self.gps_ned:
-                print("Start or end frame does not have corresponding GPS NED data.")
-                return None
-            
-            # Get GPS positions
-            gps_start = np.array(self.gps_ned[start_tns])
-            gps_end = np.array(self.gps_ned[end_tns])
-
-            # Get SLAM camera positions (already gravity-aligned)
-            cam_pose_start = start_entry['camera_poses'][0].cpu().numpy()
-            cam_pose_end = end_entry['camera_poses'][0].cpu().numpy()
-            cam_position_start = cam_pose_start[:3, 3]
-            cam_position_end = cam_pose_end[:3, 3]
-
-            # Calculate direction vectors
-            vec_gps = gps_end - gps_start
-            vec_sfm = cam_position_end - cam_position_start
-
-            if np.linalg.norm(vec_sfm) < 1e-6:
-                print("Warning: SLAM trajectory has near-zero length. Skipping scale and GPS alignment.")
-                return None
-
-            # 1. Calculate scale from the full 3D vectors
-            scale = np.linalg.norm(vec_gps) / np.linalg.norm(vec_sfm)
-            print(f"Calculated scale factor: {scale:.4f}")
-
-            # 2. Zero out Z component for 2D rotation alignment if requested
-            vec_gps_for_rot = get_z_zero_vec(vec_gps) if zero_z else vec_gps
-            vec_sfm_for_rot = get_z_zero_vec(vec_sfm) if zero_z else vec_sfm
-            
-            # 3. Calculate rotation to align SLAM vector with GPS vector
-            R_align, _ = Rotation.align_vectors(vec_sfm_for_rot, vec_gps_for_rot)
-            R_align = R_align.as_matrix().T
-
-            # 4. Create the final transformation matrix with scale, rotation, and optional translation
-            transform = torch.eye(4, device=self.device)
-            transform[:3, :3] =  scale * torch.from_numpy(R_align).float()
-            
-            print("Final reconstruction aligned to GPS direction and scale.")
-            return transform
-
-        except (ValueError, KeyError, IndexError) as e:
-            print(f"Could not perform GPS direction alignment: {e}")
-            return None
 
     def _align_saved_chunks(self, alignment_transform: torch.Tensor):
         """Iterates through all saved chunks and applies the final alignment transform to them."""
@@ -1116,97 +906,9 @@ class VisualSLAM:
             pred['pts3d'] = transformed_pts[:, :3].view(pred['pts3d'].shape)
         return predictions
 
-    def _frame_tensor_to_bgr_image(self, img_tensor: torch.Tensor) -> np.ndarray:
-        """Convert a normalized CHW tensor (dinov2 normalization) to uint8 BGR image for OpenCV."""
-        if img_tensor is None:
-            raise ValueError("Empty image tensor in frame buffer.")
-        img = img_tensor.detach().cpu()
-        if img.ndim == 4:
-            img = img[0]
-        # Denormalize using dinov2 stats
-        img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
-        mean = torch.tensor(img_norm.mean).view(3, 1, 1)
-        std = torch.tensor(img_norm.std).view(3, 1, 1)
-        img = (img * std + mean).clamp(0.0, 1.0)
-        img = (img * 255.0).byte().permute(1, 2, 0).numpy()  # HWC, RGB
-        bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        return bgr
+    
 
-    def _save_localization_start_end_debug(self, reference_db: List[Dict], start_query_frame_idx: int, end_query_frame_idx: int):
-        """
-        Save side-by-side debug images showing (query start vs reference start) and
-        (query end vs reference end) used for sequence selection.
-        """
-        if not reference_db or 'image_path' not in reference_db[0] or 'image_path' not in reference_db[-1]:
-            print("Debug preview skipped: reference DB missing image paths.")
-            return
-
-        out_dir = os.path.join(os.path.dirname(self.config.database_path), "debug_matches")
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Build query images from the cached video buffer
-        query_start_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[start_query_frame_idx])
-        query_end_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[end_query_frame_idx])
-
-        # Load reference endpoints
-        ref_start_bgr = cv2.imread(reference_db[0]['image_path'])
-        ref_end_bgr = cv2.imread(reference_db[-1]['image_path'])
-        if ref_start_bgr is None or ref_end_bgr is None:
-            print("Debug preview skipped: could not load reference endpoint images.")
-            return
-
-        def _stack_h(img_left, img_right, target_h=240):
-            def _resize_h(img, h):
-                ih, iw = img.shape[:2]
-                w = int(iw * (h / ih))
-                return cv2.resize(img, (w, h))
-            l = _resize_h(img_left, target_h)
-            r = _resize_h(img_right, target_h)
-            return cv2.hconcat([l, r])
-
-        start_pair = _stack_h(query_start_bgr, ref_start_bgr)
-        end_pair = _stack_h(query_end_bgr, ref_end_bgr)
-
-        start_path = os.path.join(out_dir, f"localization_start_pair_q{start_query_frame_idx:06d}.jpg")
-        end_path = os.path.join(out_dir, f"localization_end_pair_q{end_query_frame_idx:06d}.jpg")
-
-        cv2.imwrite(start_path, start_pair)
-        cv2.imwrite(end_path, end_pair)
-        print(f"Saved relocalization start/end previews to:\n  {start_path}\n  {end_path}")
-
-    def _save_query_db_match_debug(self, chunk_idx: int, query_image_idx_in_chunk: int, query_image_identifier: str, db_image_path: str):
-        """Save a side-by-side preview of a query frame (from buffer) and its matched DB image."""
-        try:
-            # Extract frame index from identifiers like 'frame_123'
-            base = os.path.basename(query_image_identifier)
-            name, _sep, _ext = base.partition('.')
-            digits = ''.join([c for c in name if c.isdigit()])
-            frame_idx = int(digits)
-
-            query_bgr = self._frame_tensor_to_bgr_image(self.frame_buffer[frame_idx])
-            ref_bgr = cv2.imread(db_image_path)
-            if ref_bgr is None:
-                print(f"Warning: Could not read reference image at {db_image_path} for debug match.")
-                return
-
-            # Resize and stack
-            target_h = 240
-            def _resize_h(img, h):
-                ih, iw = img.shape[:2]
-                w = int(iw * (h / ih))
-                return cv2.resize(img, (w, h))
-            q_res = _resize_h(query_bgr, target_h)
-            r_res = _resize_h(ref_bgr, target_h)
-            stacked = cv2.hconcat([q_res, r_res])
-
-            # Output path next to database
-            out_dir = os.path.join(os.path.dirname(self.config.database_path), "debug_matches")
-            os.makedirs(out_dir, exist_ok=True)
-            save_path = os.path.join(out_dir, f"chunk_{chunk_idx:04d}_match_q{frame_idx:06d}_idx{query_image_idx_in_chunk:03d}.jpg")
-            cv2.imwrite(save_path, stacked)
-            print(f"Saved relocalization match preview to {save_path}")
-        except Exception as e:
-            print(f"Warning: Failed to save relocalization match preview: {e}")
+    
 
     def _process_chunk_and_update_db(self, predictions, paths, ground_normal, plane_d, place_vectors):
         """Processes predictions and updates the database list."""
