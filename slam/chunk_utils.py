@@ -21,7 +21,9 @@ def save_chunk(
     max_depth: float,
     video_path: Optional[str] = None,
     frametimes_ns: Optional[List[int]] = None,
-    frame_pos: Optional[List[int]] = None
+    frame_pos: Optional[List[int]] = None,
+    intrinsics: Optional[np.ndarray] = None,
+    image_shape: Optional[tuple] = None
 ):
     """
     Saves the processed data for a chunk to a .pt file.
@@ -83,6 +85,10 @@ def save_chunk(
         metadata['frametimes_ns'] = frametimes_ns
     if frame_pos:
         metadata['frame_pos'] = frame_pos
+    if intrinsics is not None:
+        metadata['intrinsics'] = intrinsics
+    if image_shape is not None:
+        metadata['image_shape'] = image_shape
         
     torch.save(metadata, os.path.join(chunk_dir, "metadata.pt"))
     print(f"Saved chunk data for chunk {chunk_idx} to {chunk_dir}")
@@ -102,10 +108,13 @@ def save_chunk_with_interpolation(
     stride: int,
     video_path: Optional[str] = None,
     frametimes_ns: Optional[List[int]] = None,
-    frame_pos_buffer: Optional[List[int]] = None
+    frame_pos_buffer: Optional[List[int]] = None,
+    intrinsics: Optional[np.ndarray] = None,
+    image_shape: Optional[tuple] = None
 ):
     """
-    Handles pose interpolation if a stride is used and saves the complete data for a chunk.
+    Saves keyframe poses and normals for a chunk without interpolation.
+    Interpolation will be done in the visualization code based on frame IDs and stride.
     
     Args:
         chunk_idx: Index of the chunk
@@ -123,78 +132,53 @@ def save_chunk_with_interpolation(
         frametimes_ns: List of frame timestamps in nanoseconds
         frame_pos_buffer: List of frame positions in video
     """
-    # --- Handle Pose Interpolation ---
-    if stride > 1 and len(pred_paths) > 1:
-        full_chunk_paths = all_processed_paths[chunk_start_idx:chunk_end_idx]
-        key_frame_poses = [p['camera_poses'][0].cpu().numpy() for p in predictions]
-        
-        try:
-            key_frame_indices = [full_chunk_paths.index(p) for p in pred_paths]
-        except ValueError:
-            # Fallback if a path isn't found, though this shouldn't happen
-            poses_to_save = [p['camera_poses'] for p in predictions]
-            paths_to_save = pred_paths
-            is_reconstructed = [True] * len(predictions)
-        else:
-            slerp = Slerp(key_frame_indices, Rotation.from_matrix([p[:3, :3] for p in key_frame_poses]))
-            key_translations = np.array([p[:3, 3] for p in key_frame_poses])
-            
-            min_idx, max_idx = min(key_frame_indices), max(key_frame_indices)
-            interp_indices = np.arange(min_idx, max_idx + 1)
-            
-            interp_rotations = slerp(interp_indices).as_matrix()
-            interp_translations = np.array([np.interp(interp_indices, key_frame_indices, key_translations[:, i]) for i in range(3)]).T
-            
-            interpolated_poses_map = {}
-            for i, frame_idx in enumerate(interp_indices):
-                pose = np.eye(4)
-                pose[:3, :3] = interp_rotations[i]
-                pose[:3, 3] = interp_translations[i]
-                interpolated_poses_map[frame_idx] = torch.from_numpy(pose).float().unsqueeze(0)
-
-            poses_to_save, paths_to_save, is_reconstructed = [], [], []
-            for i, path in enumerate(full_chunk_paths):
-                if min_idx <= i <= max_idx:
-                    poses_to_save.append(interpolated_poses_map[i])
-                    paths_to_save.append(path)
-                    is_reconstructed.append(i in key_frame_indices)
-    else:
-        poses_to_save = [p['camera_poses'] for p in predictions]
-        paths_to_save = pred_paths
-        is_reconstructed = [True] * len(predictions)
-        
+    # Save only keyframe poses (no interpolation)
+    poses_to_save = [p['camera_poses'] for p in predictions]
+    paths_to_save = pred_paths
+    is_reconstructed = [True] * len(predictions)  # All saved poses are keyframes
+    
+    print(f"  Chunk {chunk_idx}: Saving {len(poses_to_save)} keyframe poses (stride={stride})")
+    
     frametimes_ns_to_save = []
     frame_pos_to_save = []
     if video_path and frametimes_ns and frame_pos_buffer:
         # When processing a video, paths are identifiers like "frame_123"
-        # We extract the index from the identifier to get the real metadata.
+        # Extract the frame index from each path and get corresponding metadata
         for path in paths_to_save:
             try:
                 base = os.path.basename(path)
                 name, _sep, _ext = base.partition('.')
                 digits = ''.join([c for c in name if c.isdigit()])
-                frame_idx = int(digits)
-                original_list_idx = all_processed_paths.index(path)
-                frametimes_ns_to_save.append(frametimes_ns[original_list_idx])
-                frame_pos_to_save.append(frame_pos_buffer[original_list_idx])
+                frame_idx_from_path = int(digits)
+                
+                # The frame index in the path corresponds to the index in frame_pos_buffer/frametimes_ns
+                if frame_idx_from_path < len(frame_pos_buffer) and frame_idx_from_path < len(frametimes_ns):
+                    frame_pos_to_save.append(frame_pos_buffer[frame_idx_from_path])
+                    frametimes_ns_to_save.append(frametimes_ns[frame_idx_from_path])
+                else:
+                    print(f"Warning: frame index {frame_idx_from_path} out of bounds for buffers (len={len(frame_pos_buffer)})")
+                    frame_pos_to_save.append(frame_idx_from_path)
+                    frametimes_ns_to_save.append(0)
+                    
             except (ValueError, IndexError) as e:
                 print(f"Warning: Could not parse frame index from path '{path}'. Skipping metadata. Error: {e}")
 
-    # Note: Normals are not interpolated, they are saved per-chunk and associated with the keyframes.
-    # This logic assumes normals are constant for the reconstructed part of the chunk.
+    # Save stride information so visualization code can interpolate
     save_chunk(
         chunk_idx, 
         predictions, 
         poses_to_save, 
         paths_to_save, 
         is_reconstructed, 
-        all_normals, 
-        all_plane_ds, 
+        all_normals,  # Save only keyframe normals
+        all_plane_ds,  # Save only keyframe plane_ds
         output_dir,
         max_depth,
         video_path,
         frametimes_ns_to_save, 
-        frame_pos_to_save
+        frame_pos_to_save,
+        intrinsics,
+        image_shape
     )
 
 

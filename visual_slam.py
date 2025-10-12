@@ -8,7 +8,6 @@ from typing import List, Dict, Tuple
 
 from mapanything.models import MapAnything
 from mapanything.utils.image import load_images, find_closest_aspect_ratio
-from place_net_trt import PlaceNetTRT
 from slam_config import SLAMConfig
 from mapanything.utils.image import rgb
 import open3d as o3d
@@ -42,7 +41,6 @@ class VisualSLAM:
 
         self._setup_paths()
         self.map_anything = None
-        self.place_net = None
         self.intrinsics = None
         self.telemetry = None
         self.frame_buffer = []
@@ -150,17 +148,23 @@ class VisualSLAM:
         self.cap = cv2.VideoCapture(self.config.video_path)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.config.start_frame)
-
-        end_frame = total_frames
-        if self.config.max_frames != -1:
-            end_frame = min(self.config.start_frame + self.config.max_frames, total_frames)
-
-        expected_frames = end_frame - self.config.start_frame
+        
+        # Calculate start and end frames from time in seconds
+        start_frame = int(self.config.start_time_seconds * self.fps)
+        if self.config.end_time_seconds <= 0:
+            end_frame = total_frames
+        else:
+            end_frame = min(int(self.config.end_time_seconds * self.fps), total_frames)
+        
+        print(f"Video FPS: {self.fps}, Total frames: {total_frames}")
+        print(f"Time range: {self.config.start_time_seconds}s - {self.config.end_time_seconds}s")
+        print(f"Frame range: {start_frame} - {end_frame}")
+        
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        expected_frames = end_frame - start_frame
         self.frame_buffer = [None] * expected_frames
         self.frame_pos_buffer = [0] * expected_frames
         self.frametimes_ns = [0] * expected_frames
-        self.place_net_descriptors = [None] * expected_frames
         
         img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
         self.img_transform = tvf.Compose(
@@ -169,7 +173,7 @@ class VisualSLAM:
 
         frame_count = 0
         invalid_cnt = 0
-        for frame_idx in range(self.config.start_frame, end_frame):
+        for frame_idx in range(start_frame, end_frame):
             ret, img = self.cap.read()
 
             if not ret:
@@ -193,11 +197,9 @@ class VisualSLAM:
             img_pil = Image.fromarray(img_rgb)
             normalized_img = self.img_transform(img_pil)
 
-            # run place net here
             self.frame_buffer[frame_count] = normalized_img
             self.frame_pos_buffer[frame_count] = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
             self.frametimes_ns[frame_count] = int(self.cap.get(cv2.CAP_PROP_POS_MSEC) * MS_TO_NS)
-            self.place_net_descriptors[frame_count] = self.place_net(img_rgb)
 
             frame_count += 1
 
@@ -207,7 +209,6 @@ class VisualSLAM:
         self.frame_buffer = self.frame_buffer[:actual_frames]
         self.frame_pos_buffer = self.frame_pos_buffer[:actual_frames]
         self.frametimes_ns = self.frametimes_ns[:actual_frames]
-        self.place_net_descriptors = self.place_net_descriptors[:actual_frames]
             
         print(f"Finished caching {actual_frames} frames.")
         
@@ -235,7 +236,6 @@ class VisualSLAM:
             self.frame_buffer = self.frame_buffer[first_id:last_id+1]
             self.frame_pos_buffer = self.frame_pos_buffer[first_id:last_id+1]
             self.frametimes_ns = self.frametimes_ns[first_id:last_id+1]
-            self.place_net_descriptors = self.place_net_descriptors[first_id:last_id+1]
         
         self.max_frames = len(self.frame_buffer)
         return True
@@ -271,11 +271,6 @@ class VisualSLAM:
         # quantize_(self.map_anything, Int8DynamicActivationInt4WeightConfig(),)
         #self.map_anything = torch.compile(self.map_anything) #, backend="tensorrt"
         
-        print("Initializing PlaceNetTRT model...")
-        self.place_net = PlaceNetTRT()
-        self.place_net.to_device(torch.device("cuda"))
-        print("PlaceNetTRT model initialized.")
-        
         # Initialize matcher for keypoint matching and verification
         self.matcher = Matcher(device=self.device, keypoint_matching_threshold=self.config.keypoint_matching_threshold)
     
@@ -306,49 +301,20 @@ class VisualSLAM:
         self._run_pipeline(relocalization_db=db_data, localization_frames=processed_image_paths)
 
     def _unpack_reference_db(self, db_data):
-        """Return (reference_db, reference_vectors) from saved database in a backward-compatible way.
-        - If db_data is a (list, tensor) tuple, return as-is
-        - If db_data is a list of dicts, try to stack 'place_net_descriptor'; otherwise compute vectors from images
+        """Unpack reference database from saved data.
+        Returns just the reference_db list (no place vectors needed anymore).
         """
         try:
             if isinstance(db_data, tuple) and len(db_data) == 2:
-                reference_db, reference_vectors = db_data
-                if not isinstance(reference_vectors, torch.Tensor):
-                    reference_vectors = torch.tensor(reference_vectors)
-                return reference_db, reference_vectors
+                reference_db, _ = db_data  # Ignore place vectors
+                return reference_db
             # Fallback: legacy format as list of entries
             if isinstance(db_data, list):
-                reference_db = db_data
-                if len(reference_db) > 0 and 'place_net_descriptor' in reference_db[0]:
-                    vectors = []
-                    for e in reference_db:
-                        v = e['place_net_descriptor']
-                        if isinstance(v, torch.Tensor):
-                            vectors.append(v.squeeze().cpu())
-                        else:
-                            vectors.append(torch.tensor(v).squeeze())
-                    reference_vectors = torch.stack(vectors, dim=0)
-                    return reference_db, reference_vectors
-                # Compute vectors from stored images
-                vectors = []
-                for e in reference_db:
-                    p = e.get('image_path')
-                    try:
-                        img_bgr = cv2.imread(p)
-                        if img_bgr is None:
-                            vectors.append(torch.zeros(128))
-                            continue
-                        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                        vec = self.place_net(img_rgb)
-                        vectors.append(torch.from_numpy(vec).squeeze())
-                    except Exception:
-                        vectors.append(torch.zeros(128))
-                reference_vectors = torch.stack(vectors, dim=0)
-                return reference_db, reference_vectors
+                return db_data
         except Exception as e:
-            print(f"Warning: Failed to unpack reference DB flexibly: {e}")
+            print(f"Warning: Failed to unpack reference DB: {e}")
         # As a last resort, treat as empty
-        return [], torch.empty(0)
+        return []
 
     def _find_and_prepare_localization_frames(self, db_data):
         """
@@ -358,107 +324,62 @@ class VisualSLAM:
         3) Trimming internal query buffers to this window to save memory
         4) Returning the trimmed query frame identifiers (e.g., 'frame_0', ...)
         """
-        # 1. Unpack database (supports legacy formats)
-        reference_db, reference_vectors = self._unpack_reference_db(db_data)
-        reference_vectors = reference_vectors.to(self.device)
+        # 1. Unpack database
+        reference_db = self._unpack_reference_db(db_data)
         print(f"Loaded reference database with {len(reference_db)} entries.")
 
-        # 2. Calculate place vectors for the query sequence (strided)
-        print("Calculating place recognition vectors for the new sequence...")
-        query_indices = [idx for idx in range(len(self.frame_buffer)) if idx % self.config.stride == 0]
-        if not query_indices:
+        # 2. Validate we have enough frames
+        if not reference_db or len(self.frame_buffer) < 25:
+            print("ERROR: Not enough frames for localization!")
             return []
-        query_vectors = [torch.from_numpy(self.place_net_descriptors[idx]).squeeze() for idx in query_indices]
-        query_vectors = torch.stack(query_vectors).to(self.device)
-        print(f"Calculated {len(query_vectors)} place vectors for the query video.")
 
-        # 3. Find best matching query frames for reference first and last using place vectors + keypoint verification
-        print("Finding best start frame match with keypoint verification...")
-        print(f"Minimum required keypoint matches: {self.config.min_keypoint_matches}")
-        sim_start = torch.cdist(query_vectors, reference_vectors[[0]])
-        # Get top 5 candidates for start frame (sorted by place distance, best first)
-        top_k = min(5, len(query_vectors))
-        top_start_distances, top_start_indices = torch.topk(sim_start.squeeze(), top_k, largest=False)
-        
-        print(f"Testing {top_k} candidates sorted by place recognition score (best to worst):")
-        
-        # Verify with keypoint matching
-        best_start_matches = 0
-        start_query_vec_idx = None
+        # Get first and last reference images
         ref_start_img_path = reference_db[0]['image_path']
-        
-        for i, idx in enumerate(top_start_indices):
-            query_vec_idx = idx.item()
-            query_frame_idx = query_indices[query_vec_idx]
-            query_img = self.frame_buffer[query_frame_idx]
-            
-            # Get detailed match info
-            num_matches, query_img_np, ref_img_rgb, keypoints0, keypoints1, matching_scores = self.matcher.count_keypoint_matches(
-                query_img, ref_start_img_path, return_details=True
-            )
-            
-            meets_threshold = num_matches >= self.config.min_keypoint_matches
-            status = "✓ VALID" if meets_threshold else "✗ BELOW THRESHOLD"
-            print(f"  Candidate {i+1} (rank #{i+1}): place_dist={top_start_distances[i].item():.4f}, keypoint_matches={num_matches} {status}")
-            
-            # Only consider candidates with enough matches
-            if meets_threshold and num_matches > best_start_matches:
-                best_start_matches = num_matches
-                start_query_vec_idx = query_vec_idx
-        
-        if start_query_vec_idx is None:
-            print(f"ERROR: No start frame candidate met the minimum threshold of {self.config.min_keypoint_matches} matches!")
-            return []
-        
-        start_query_frame_idx = query_indices[start_query_vec_idx]
-        print(f"✓ Selected start frame {start_query_frame_idx} with {best_start_matches} keypoint matches")
-        
-        print("\nFinding best end frame match with keypoint verification...")
-        sim_end = torch.cdist(query_vectors, reference_vectors[[-1]])
-        # Get top 5 candidates for end frame (sorted by place distance, best first)
-        top_end_distances, top_end_indices = torch.topk(sim_end.squeeze(), top_k, largest=False)
-        
-        print(f"Testing {top_k} candidates sorted by place recognition score (best to worst):")
-        
-        # Verify with keypoint matching
-        best_end_matches = 0
-        end_query_vec_idx = None
         ref_end_img_path = reference_db[-1]['image_path']
+
+        # 3. Match first 25 query frames against first reference frame using LOFTR
+        print("Finding best start frame using LOFTR matching on first 25 frames...")
+        num_candidates = min(25, len(self.frame_buffer))
+        best_start_matches = 0
+        start_query_frame_idx = 0
         
-        for i, idx in enumerate(top_end_indices):
-            query_vec_idx = idx.item()
-            query_frame_idx = query_indices[query_vec_idx]
-            query_img = self.frame_buffer[query_frame_idx]
+        for i in range(num_candidates):
+            query_img = self.frame_buffer[i]
+            num_matches = self.matcher.count_keypoint_matches(query_img, ref_start_img_path, return_details=False)
             
-            # Get detailed match info
-            num_matches, query_img_np, ref_img_rgb, keypoints0, keypoints1, matching_scores = self.matcher.count_keypoint_matches(
-                query_img, ref_end_img_path, return_details=True
-            )
+            print(f"  Frame {i}: {num_matches} LOFTR matches")
             
-            meets_threshold = num_matches >= self.config.min_keypoint_matches
-            status = "✓ VALID" if meets_threshold else "✗ BELOW THRESHOLD"
-            print(f"  Candidate {i+1} (rank #{i+1}): place_dist={top_end_distances[i].item():.4f}, keypoint_matches={num_matches} {status}")
+            if num_matches > best_start_matches:
+                best_start_matches = num_matches
+                start_query_frame_idx = i
+        
+        print(f"✓ Selected start frame {start_query_frame_idx} with {best_start_matches} LOFTR matches")
+        
+        # 4. Match last 25 query frames against last reference frame using LOFTR
+        print("\nFinding best end frame using LOFTR matching on last 25 frames...")
+        start_idx = max(0, len(self.frame_buffer) - 25)
+        best_end_matches = 0
+        end_query_frame_idx = len(self.frame_buffer) - 1
+        
+        for i in range(start_idx, len(self.frame_buffer)):
+            query_img = self.frame_buffer[i]
+            num_matches = self.matcher.count_keypoint_matches(query_img, ref_end_img_path, return_details=False)
             
-            # Only consider candidates with enough matches
-            if meets_threshold and num_matches > best_end_matches:
+            print(f"  Frame {i}: {num_matches} LOFTR matches")
+            
+            if num_matches > best_end_matches:
                 best_end_matches = num_matches
-                end_query_vec_idx = query_vec_idx
+                end_query_frame_idx = i
         
-        if end_query_vec_idx is None:
-            print(f"ERROR: No end frame candidate met the minimum threshold of {self.config.min_keypoint_matches} matches!")
-            return []
-        
-        end_query_frame_idx = query_indices[end_query_vec_idx]
-        print(f"✓ Selected end frame {end_query_frame_idx} with {best_end_matches} keypoint matches")
+        print(f"✓ Selected end frame {end_query_frame_idx} with {best_end_matches} LOFTR matches")
         
         if start_query_frame_idx > end_query_frame_idx:
             start_query_frame_idx, end_query_frame_idx = end_query_frame_idx, start_query_frame_idx
         
-        print("\n" + "="*70)
+        print("="*70)
         print(f"FINAL LOCALIZATION RESULTS:")
-        print(f"  ✓ Start frame: {start_query_frame_idx} with {best_start_matches} keypoint matches")
-        print(f"  ✓ End frame:   {end_query_frame_idx} with {best_end_matches} keypoint matches")
-        print(f"  Minimum threshold: {self.config.min_keypoint_matches} matches (both passed)")
+        print(f"  ✓ Start frame: {start_query_frame_idx} with {best_start_matches} LOFTR matches")
+        print(f"  ✓ End frame:   {end_query_frame_idx} with {best_end_matches} LOFTR matches")
         print("="*70 + "\n")
 
         # 4. Add buffer around start/end and trim buffers
@@ -479,12 +400,12 @@ class VisualSLAM:
         self.frame_buffer = self.frame_buffer[q_start:q_end]
         self.frame_pos_buffer = self.frame_pos_buffer[q_start:q_end]
         self.frametimes_ns = self.frametimes_ns[q_start:q_end]
-        self.place_net_descriptors = self.place_net_descriptors[q_start:q_end]
         print(f"Query buffers trimmed to {len(self.frame_buffer)} frames.")
 
-        # Build identifiers for the trimmed frames
-        selected_query_paths = [f"frame_{i}" for i in range(len(self.frame_buffer))]
-        print(f"Selected {len(selected_query_paths)} query frames for localization.")
+        # Build identifiers for the trimmed frames, respecting stride
+        # Apply stride to get the actual frames to process
+        selected_query_paths = [f"frame_{i}" for i in range(0, len(self.frame_buffer), self.config.stride)]
+        print(f"Selected {len(selected_query_paths)} query frames for localization (stride={self.config.stride}).")
         return selected_query_paths
 
     def _preprocess_views(self, views):
@@ -510,12 +431,19 @@ class VisualSLAM:
         overall_start_time = time.time()
 
         if localization_frames:
+            # For relocalization, localization_frames contains the pre-selected frames (may already be strided)
             processed_image_paths = localization_frames
+            # Create full frame list for proper interpolation (ALL frames from buffer)
+            all_frame_paths = [f"frame_{i}" for i in range(len(self.frame_buffer))]
             print(f"Running localization on a pre-selected sequence of {len(processed_image_paths)} frames.")
+            print(f"  Full frame range for interpolation: frame_0 to frame_{len(all_frame_paths)-1}")
         elif self.config.video_path:
-            processed_image_paths = [f"frame_{i}" for i in range(len(self.frame_buffer))]
-            processed_image_paths = processed_image_paths[::self.config.stride]
+            # Create full frame list (ALL frames from buffer, not just strided ones)
+            all_frame_paths = [f"frame_{i}" for i in range(len(self.frame_buffer))]
+            # Process only every Nth frame (with stride)
+            processed_image_paths = all_frame_paths[::self.config.stride]
             print(f"Processing {len(self.frame_buffer)} frames from video. With stride={self.config.stride}, processing {len(processed_image_paths)} frames.")
+            print(f"  Full frame range for interpolation: frame_0 to frame_{len(all_frame_paths)-1}")
         else:
             raise ValueError("Video-only mode: image list input is not supported.")
 
@@ -547,22 +475,8 @@ class VisualSLAM:
                 continue
 
             # preprocess views
-            ignore_keys = set(
-                [
-                    "instance",
-                    "idx",
-                    "true_shape",
-                    "data_norm_type",
-                    "place_net_descriptor",
-                ]
-            )
-            for view in view_set:
-                for name in view.keys():
-                    if name in ignore_keys:
-                        continue
-                    view[name] = view[name].to(self.device, non_blocking=True)
-
-            view_set_pre = preprocess_input_views_for_inference(view_set)
+            view_set_pre = self._preprocess_views(view_set)
+            view_set_pre = preprocess_input_views_for_inference(view_set_pre)
 
             with torch.no_grad():
                 with torch.autocast("cuda", enabled=True, dtype=torch.float16):
@@ -613,11 +527,25 @@ class VisualSLAM:
             # Save chunk data and update database
             all_normals_for_chunk = [ground_normal] * len(query_predictions_to_save) if ground_normal is not None else [None] * len(query_predictions_to_save)
             all_plane_ds_for_chunk = [plane_d] * len(query_predictions_to_save) if plane_d is not None else [None] * len(query_predictions_to_save)
+            
+            # Get intrinsics and image shape for rendering
+            intrinsics_np = self.intrinsics.cpu().numpy() if isinstance(self.intrinsics, torch.Tensor) else np.array(self.intrinsics)
+            image_shape = (self.target_size[1], self.target_size[0])  # (height, width)
+            
+            # Calculate full frame range for interpolation
+            # Extract frame indices from first and last keyframe paths
+            first_frame_idx = int(''.join(c for c in query_paths_to_save[0] if c.isdigit()))
+            last_frame_idx = int(''.join(c for c in query_paths_to_save[-1] if c.isdigit()))
+            
+            # These indices correspond to positions in all_frame_paths
+            full_chunk_start_idx = first_frame_idx
+            full_chunk_end_idx = last_frame_idx + 1  # +1 for exclusive end
+            
             save_chunk_with_interpolation(
                 i, 
-                chunk_start_idx, 
-                chunk_end_idx, 
-                processed_image_paths, 
+                full_chunk_start_idx, 
+                full_chunk_end_idx, 
+                all_frame_paths, 
                 query_predictions_to_save, 
                 query_paths_to_save, 
                 all_normals_for_chunk, 
@@ -627,7 +555,9 @@ class VisualSLAM:
                 self.config.stride,
                 self.config.video_path,
                 self.frametimes_ns,
-                self.frame_pos_buffer
+                self.frame_pos_buffer,
+                intrinsics_np,
+                image_shape
             )
 
             processed_chunk_data = self._process_chunk_and_update_db(
@@ -1080,7 +1010,6 @@ class VisualSLAM:
                 digits = ''.join([c for c in name if c.isdigit()])
                 frame_idx = int(digits)
                 img_tensor = self.frame_buffer[frame_idx]
-                place_net_descriptor = self.place_net_descriptors[frame_idx]
                 
                 view = {
                     'img': img_tensor[None], # Add batch dim
@@ -1088,7 +1017,6 @@ class VisualSLAM:
                     'idx': frame_idx,
                     'instance': str(frame_idx),
                     'data_norm_type': ['dinov2'],
-                    'place_net_descriptor': place_net_descriptor,
                 }
                 views.append(view)
             except (ValueError, IndexError) as e:
@@ -1103,10 +1031,6 @@ class VisualSLAM:
             transformed_pts = (transform.squeeze() @ pts3d_hom.T).T
             pred['pts3d'] = transformed_pts[:, :3].view(pred['pts3d'].shape)
         return predictions
-
-    
-
-    
 
     def _process_chunk_and_update_db(self, predictions, paths, ground_normal, plane_d, place_vectors):
         """Processes predictions and updates the database list."""
@@ -1128,8 +1052,6 @@ class VisualSLAM:
                 "depth_z": pred['depth_z'].cpu(),
                 "intrinsics": self.intrinsics.detach().cpu() if isinstance(self.intrinsics, torch.Tensor) else torch.tensor(self.intrinsics, dtype=torch.float32)
             }
-            if place_vectors is not None and i < len(place_vectors):
-                entry["place_net_descriptor"] = place_vectors[i].cpu()
             # Attach GPS NED to database if available (per frame)
             try:
                 if hasattr(self, 'gps_ned') and self.gps_ned is not None and self.config.video_path:
@@ -1189,30 +1111,10 @@ class VisualSLAM:
                 aligned_pose = alignment_transform.to(original_pose.device) @ original_pose
                 entry['camera_poses'] = aligned_pose
         
-        # --- Prepare data for saving ---
-        # Separate place vectors from the main database if they exist
-        main_db_for_saving = []
-        place_vectors_for_saving = []
-        has_place_vectors = 'place_net_descriptor' in database[0] if database else False
-        
-        if has_place_vectors:
-            print("Separating place recognition vectors for optimized loading.")
-            for entry in database:
-                main_db_for_saving.append({k: v for k, v in entry.items() if k != 'place_net_descriptor'})
-                place_vectors_for_saving.append(entry['place_net_descriptor'])
-            
-            # Stack vectors into a single tensor
-            place_vectors_tensor = torch.stack(place_vectors_for_saving, dim=0)
-            
-            # Save the main database and the vectors as a tuple
-            save_data = (main_db_for_saving, place_vectors_tensor)
-        else:
-            # Save only the main database if no vectors are present
-            save_data = database
-
+        # --- Save database ---
         try:
             os.makedirs(os.path.dirname(self.config.database_path), exist_ok=True)
-            torch.save(save_data, self.config.database_path)
+            torch.save(database, self.config.database_path)
             print(f"Saved SLAM database with {len(database)} entries to {self.config.database_path}")
         except Exception as e:
             print(f"Error saving database: {e}")

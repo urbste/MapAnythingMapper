@@ -13,8 +13,8 @@ class SLAMConfig:
     database_path: str = None # If None, will be created relative to image_folder
     
     # --- Sequence Processing ---
-    start_frame: int = 0
-    max_frames: int = -1 # -1 for all frames
+    start_time_seconds: float = 0.0 # Start time in seconds for video processing
+    end_time_seconds: float = -1.0 # End time in seconds for video processing (-1 for entire video)
     chunk_size: int = 30
     overlap_size: int = 2
     stride: int = 3

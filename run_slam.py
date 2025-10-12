@@ -16,8 +16,8 @@ def main(args):
         cam_dist_path=args.cam_dist_path,
         output_dir=args.output_dir,
         database_path=args.database_path,
-        start_frame=args.start_frame,
-        max_frames=args.max_frames,
+        start_time_seconds=args.start_time,
+        end_time_seconds=args.end_time,
         chunk_size=args.chunk_size,
         overlap_size=args.overlap_size,
         stride=args.stride,
@@ -74,17 +74,17 @@ if __name__ == "__main__":
     parser.add_argument("--database_path", type=str, default="/home/steffen/Data/GPStrava/Nina/Reference/nina1/_slam_results/slam_database.pt", help="Path to save the SLAM database. If not set, it's created in a _slam_results folder.")
 
     # --- Sequence Control ---
-    parser.add_argument("--start_frame", type=int, default=240, help="Start frame for video processing.")
-    parser.add_argument("--max_frames", type=int, default=150, help="Maximum number of frames to process (-1 for all).")
-    parser.add_argument("--stride", type=int, default=3, help="Process every Nth frame.")
+    parser.add_argument("--start_time", type=float, default=9.0, help="Start time in seconds for video processing.")
+    parser.add_argument("--end_time", type=float, default=118.0, help="End time in seconds for video processing (-1 for entire video).")
+    parser.add_argument("--stride", type=int, default=2, help="Process every Nth frame.")
 
     # --- SLAM Parameters ---
-    parser.add_argument("--chunk_size", type=int, default=15, help="Size of each processing chunk.")
+    parser.add_argument("--chunk_size", type=int, default=12, help="Size of each processing chunk.")
     parser.add_argument("--overlap_size", type=int, default=2, help="Number of overlapping frames between chunks.")
     parser.add_argument("--pcl_confidence", type=float, default=0.8, help="Confidence threshold for points in the point cloud.")
     
     # --- Visualization ---
-    parser.add_argument("--visualize", action='store_true', default=True, help="Enable post-processing and visualization of the results.")
+    parser.add_argument("--visualize", action='store_true', default=False, help="Enable post-processing and visualization of the results.")
     parser.add_argument("--debug_viz", action='store_true', default=False, help="Enable saving of debug visualizations for each chunk.")
 
     args = parser.parse_args()
