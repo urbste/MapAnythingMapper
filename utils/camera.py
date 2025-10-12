@@ -97,11 +97,6 @@ class Camera:
         # Flip the y-coordinate of the principal point
         self.prior.principal_point.value[0] = self.prior.image_width - self.prior.principal_point.value[0]
         self.prior.principal_point.value[1] = self.prior.image_height - self.prior.principal_point.value[1]
-        
-        # Depending on the distortion model, you might need to adjust distortion coefficients
-        if self.prior.camera_intrinsics_model_type in ["FISHEYE", "DIVISION_UNDISTORTION"]:
-            # This example assumes no changes, but adjust if your model specifications require
-            pass
-        
+                
         # Re-set the camera intrinsics
         self.intr.SetFromCameraIntrinsicsPriors(self.prior)

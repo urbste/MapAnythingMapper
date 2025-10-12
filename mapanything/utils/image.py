@@ -175,7 +175,6 @@ def load_images(
         bayer_format (bool, optional): If True, read images in Bayer format. Defaults to False.
         resolution_set (int, optional): Resolution set to use for "fixed_mapping" mode (518 or 512). Defaults to 518.
         stride (int, optional): Load every nth image from the input. stride=1 loads all images, stride=2 loads every 2nd image, etc. Defaults to 1.
-        crop_bottom_percent (float, optional): Percentage of the bottom of the image to crop (e.g., 0.1 for 10%). Defaults to 0.0.
 
     Returns:
         list: List of dictionaries containing image data and metadata

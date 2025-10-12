@@ -21,16 +21,17 @@ class SLAMConfig:
     
     # --- Camera Intrinsics ---
     resolution_set: int = 518
-    org_image_size: Tuple[int, int] = (960, 540)
-    base_intrinsics: Tuple[float, float, float, float] = (491.0157875755563, 491.0157875755563, 475.701166946744, 279.55005345005975)
     
     # --- Relocalization ---
     relocalization_db_path: str = None # Path to an existing slam_database.pt for relocalization
     create_debug_matches: bool = False # If True, saves images of the relocalization matches
     relocalization_threshold_percent: float = 10 # Threshold for the relocalization matches in percent
     max_relocalization_threshold: float = 0.23
-    relocalization_frame_overlap: int = 10 # Number of frames to overlap at start and end of a localized sequence
-    relocalization_gps_max_pair_distance_m: float = 50.0 # Max allowed GPS distance (meters) between query and matched reference priors
+    relocalization_frame_overlap: int = 4 # Number of frames to overlap at start and end of a localized sequence
+    keypoint_matching_threshold: float = 0.2 # Confidence threshold for keypoint matches in relocalization
+    min_keypoint_matches: int = 1000 # Minimum number of keypoint matches required for relocalization
+    spatial_distance_threshold_m: float = 1.0 # Max spatial distance (meters) for accepting a reference pose as prior
+    num_reference_priors: int = 3 # Number of consecutive reference frames to add as priors when within distance threshold
     
     # --- Point Cloud Generation ---
     max_depth_for_point_cloud: float = 5.0 # Max depth in meters to include in the final PCL

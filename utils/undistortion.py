@@ -121,10 +121,10 @@ class UndistortionMaps:
                 image_pt_undist = np.array([c, r])
                 
                 # Convert to camera coordinates in undistorted camera
-                pt_in_undist_camera = self.cam_dist_.CameraIntrinsics().ImageToCameraCoordinates(image_pt_undist)
+                pt_in_undist_camera = self.cam_undist_.CameraIntrinsics().ImageToCameraCoordinates(image_pt_undist)
                 
                 # Project to distorted camera coordinates
-                distorted_pt = self.cam_undist_.CameraIntrinsics().CameraToImageCoordinates(pt_in_undist_camera)
+                distorted_pt = self.cam_dist_.CameraIntrinsics().CameraToImageCoordinates(pt_in_undist_camera)
                 
                 # Store the mapping
                 self.map_x[r, c] = distorted_pt[0]

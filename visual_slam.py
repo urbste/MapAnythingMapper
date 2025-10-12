@@ -1,5 +1,6 @@
 import torch
 import os
+import shutil
 import time
 import cv2
 import numpy as np
@@ -12,7 +13,6 @@ from slam_config import SLAMConfig
 from mapanything.utils.image import rgb
 import open3d as o3d
 from PIL import Image
-from scipy.spatial.transform import Rotation, Slerp
 from mapanything.utils.inference import preprocess_input_views_for_inference, postprocess_model_outputs_for_inference
 from utils.telemetry_converter import TelemetryImporter
 from utils.undistortion import create_undistortion_maps_from_file
@@ -20,12 +20,18 @@ from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_
 import torchvision.transforms as tvf
 from scipy.spatial.transform import Rotation as RS
 import glob
-from slam.debug_utils import save_localization_start_end_debug, save_query_db_match_debug
+from slam.debug_utils import save_query_db_match_debug
 from slam.trajectory_utils import save_query_trajectory_and_normals
 from slam.alignment_utils import align_reconstruction_to_gravity, align_reconstruction_to_gps_direction
 from slam.geo_utils import ecef_to_ned
 from utils.math import scale_intrinsics
 from slam.plane_utils import estimate_ground_plane
+from slam.chunk_utils import (
+    save_chunk_with_interpolation,
+    save_chunks_for_visualization, 
+    save_debug_chunk_visualization
+)
+from slam.matcher import Matcher
 
 MS_TO_NS = 1_000_000
 
@@ -37,7 +43,7 @@ class VisualSLAM:
         self._setup_paths()
         self.map_anything = None
         self.place_net = None
-        self.intrinsics = self._setup_intrinsics()
+        self.intrinsics = None
         self.telemetry = None
         self.frame_buffer = []
         self.frametimes_ns = []
@@ -53,8 +59,9 @@ class VisualSLAM:
         if not self.config.video_path:
             raise ValueError("Video-only mode: 'video_path' must be provided.")
         results_dir_base = self.config.video_path
+        results_dir = os.path.join(os.path.dirname(results_dir_base), "_slam_results")
+        
         if self.config.output_dir is None or self.config.database_path is None:
-            results_dir = os.path.join(os.path.dirname(results_dir_base), "_slam_results")
             os.makedirs(results_dir, exist_ok=True)
             
             if self.config.output_dir is None:
@@ -64,8 +71,6 @@ class VisualSLAM:
                 db_name = os.path.basename(os.path.normpath(results_dir_base)) + "_db.pt"
                 self.config.database_path = os.path.join(results_dir, db_name)
         
-        os.makedirs(self.config.output_dir, exist_ok=True)
-
         # Setup database path, making it absolute if it's relative
         if not os.path.isabs(self.config.database_path):
             if self.config.database_path is None:
@@ -74,21 +79,67 @@ class VisualSLAM:
                 db_name = os.path.basename(self.config.database_path)
                 self.config.database_path = os.path.join(results_dir, db_name)
         
+        # Clean existing output directory to prevent conflicts with old chunks
+        if os.path.exists(self.config.output_dir):
+            print(f"Removing existing output directory: {self.config.output_dir}")
+            shutil.rmtree(self.config.output_dir)
+        
+        # Create fresh output directory
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        
         # Ensure the directory for the database exists
         db_dir = os.path.dirname(self.config.database_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
+        
+        # Clean existing database-related files to prevent conflicts
+        if os.path.exists(self.config.database_path):
+            print(f"Removing existing database file: {self.config.database_path}")
+            os.remove(self.config.database_path)
+        
+        # Clean related output files in the database directory
+        if db_dir and os.path.exists(db_dir):
+            # Remove reference images directory if it exists
+            ref_images_dir = os.path.join(db_dir, "reference_images")
+            if os.path.exists(ref_images_dir):
+                print(f"Removing existing reference images: {ref_images_dir}")
+                shutil.rmtree(ref_images_dir)
+            
+            # Remove debug directories if they exist
+            debug_keypoint_dir = os.path.join(db_dir, "debug_keypoint_matches")
+            if os.path.exists(debug_keypoint_dir):
+                print(f"Removing existing debug keypoint matches: {debug_keypoint_dir}")
+                shutil.rmtree(debug_keypoint_dir)
+            
+            # Remove alignment transform if it exists
+            alignment_path = os.path.join(db_dir, "alignment.pt")
+            if os.path.exists(alignment_path):
+                print(f"Removing existing alignment file: {alignment_path}")
+                os.remove(alignment_path)
+            
+            # Remove trajectory files if they exist
+            traj_path = os.path.join(db_dir, "query_trajectory_only.ply")
+            if os.path.exists(traj_path):
+                print(f"Removing existing trajectory file: {traj_path}")
+                os.remove(traj_path)
+            
+            normals_path = os.path.join(db_dir, "query_normals.ply")
+            if os.path.exists(normals_path):
+                print(f"Removing existing normals file: {normals_path}")
+                os.remove(normals_path)
 
-        print(f"Using output directory: {self.config.output_dir}")
-        print(f"Using database path: {self.config.database_path}")
+        print(f"✓ Output directory: {self.config.output_dir}")
+        print(f"✓ Database path: {self.config.database_path}")
 
     def _cache_frames(self):
         """Cache video frames and associated telemetry data with memory management."""
         print("Start caching frames.")
         
-        if self.config.cam_dist_path:
-            print("Setting up undistortion maps.")
-            self.undistortion_maps = create_undistortion_maps_from_file(self.config.cam_dist_path)
+        print("Setting up undistortion maps.")
+        self.undistortion_maps = create_undistortion_maps_from_file(self.config.cam_dist_path)
+        self.camera_intrinsics_undist = self.undistortion_maps.cam_undist.get_camera()
+        self.camera_intrinsics_dist = self.undistortion_maps.cam_dist.get_camera()
+        self.intrinsics = self._setup_intrinsics()
 
         if self.config.telemetry_file:
             self.telemetry = TelemetryImporter()
@@ -148,7 +199,6 @@ class VisualSLAM:
             self.frametimes_ns[frame_count] = int(self.cap.get(cv2.CAP_PROP_POS_MSEC) * MS_TO_NS)
             self.place_net_descriptors[frame_count] = self.place_net(img_rgb)
 
-
             frame_count += 1
 
         self.cap.release()
@@ -166,11 +216,7 @@ class VisualSLAM:
                 self.telemetry.get_gps_pos_at_frametimes(self.frametimes_ns))
             
             # imu to camera transformation
-            R_c_i = RS.from_quat([
-                -0.005614731940060652,
-                0.7154606008027313,
-                -0.6985867170157808,
-                0.00782318946143889]).as_matrix()
+            R_c_i = RS.from_quat([-0.005614731940060652, 0.7154606008027313, -0.6985867170157808, 0.00782318946143889]).as_matrix()
 
             self.gravity = self.telemetry.get_gravity_at_times(self.interp_ftns, R_c_i)
             self.gps_ned = ecef_to_ned(self.gps_ecef, self.llh0, self.interp_ftns)
@@ -196,8 +242,8 @@ class VisualSLAM:
 
     def _setup_intrinsics(self):
         """Calculates and scales the camera intrinsics."""
-        org_width, org_height = self.config.org_image_size
-        fx, fy, cx, cy = self.config.base_intrinsics
+        self.intrinsics = self.camera_intrinsics_undist
+        org_width, org_height = self.camera_intrinsics_undist.ImageWidth(), self.camera_intrinsics_undist.ImageHeight()
         
         average_aspect_ratio = org_width / org_height
         target_width, target_height = find_closest_aspect_ratio(average_aspect_ratio, self.config.resolution_set)
@@ -206,7 +252,7 @@ class VisualSLAM:
         scale_x = target_width / org_width
         scale_y = target_height / org_height
 
-        intrinsics_tensor = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32, device=self.device)
+        intrinsics_tensor = torch.tensor(self.camera_intrinsics_undist.GetCalibrationMatrix()).float()
         return scale_intrinsics(intrinsics_tensor, scale_x, scale_y)
 
     def _initialize_models(self):
@@ -223,12 +269,15 @@ class VisualSLAM:
         # )
 
         # quantize_(self.map_anything, Int8DynamicActivationInt4WeightConfig(),)
-        #self.map_anything = torch.compile(self.map_anything, backend="tensorrt")
+        #self.map_anything = torch.compile(self.map_anything) #, backend="tensorrt"
         
         print("Initializing PlaceNetTRT model...")
         self.place_net = PlaceNetTRT()
         self.place_net.to_device(torch.device("cuda"))
         print("PlaceNetTRT model initialized.")
+        
+        # Initialize matcher for keypoint matching and verification
+        self.matcher = Matcher(device=self.device, keypoint_matching_threshold=self.config.keypoint_matching_threshold)
     
     def run_slam_for_sequence(self):
         """Runs the standard sequential SLAM pipeline for a new video sequence."""
@@ -323,24 +372,94 @@ class VisualSLAM:
         query_vectors = torch.stack(query_vectors).to(self.device)
         print(f"Calculated {len(query_vectors)} place vectors for the query video.")
 
-        # 3. Find best matching query frames for reference first and last
+        # 3. Find best matching query frames for reference first and last using place vectors + keypoint verification
+        print("Finding best start frame match with keypoint verification...")
+        print(f"Minimum required keypoint matches: {self.config.min_keypoint_matches}")
         sim_start = torch.cdist(query_vectors, reference_vectors[[0]])
-        sim_end = torch.cdist(query_vectors, reference_vectors[[-1]])
-        start_query_vec_idx = torch.argmin(sim_start).item()
-        end_query_vec_idx = torch.argmin(sim_end).item()
+        # Get top 5 candidates for start frame (sorted by place distance, best first)
+        top_k = min(5, len(query_vectors))
+        top_start_distances, top_start_indices = torch.topk(sim_start.squeeze(), top_k, largest=False)
+        
+        print(f"Testing {top_k} candidates sorted by place recognition score (best to worst):")
+        
+        # Verify with keypoint matching
+        best_start_matches = 0
+        start_query_vec_idx = None
+        ref_start_img_path = reference_db[0]['image_path']
+        
+        for i, idx in enumerate(top_start_indices):
+            query_vec_idx = idx.item()
+            query_frame_idx = query_indices[query_vec_idx]
+            query_img = self.frame_buffer[query_frame_idx]
+            
+            # Get detailed match info
+            num_matches, query_img_np, ref_img_rgb, keypoints0, keypoints1, matching_scores = self.matcher.count_keypoint_matches(
+                query_img, ref_start_img_path, return_details=True
+            )
+            
+            meets_threshold = num_matches >= self.config.min_keypoint_matches
+            status = "✓ VALID" if meets_threshold else "✗ BELOW THRESHOLD"
+            print(f"  Candidate {i+1} (rank #{i+1}): place_dist={top_start_distances[i].item():.4f}, keypoint_matches={num_matches} {status}")
+            
+            # Only consider candidates with enough matches
+            if meets_threshold and num_matches > best_start_matches:
+                best_start_matches = num_matches
+                start_query_vec_idx = query_vec_idx
+        
+        if start_query_vec_idx is None:
+            print(f"ERROR: No start frame candidate met the minimum threshold of {self.config.min_keypoint_matches} matches!")
+            return []
+        
         start_query_frame_idx = query_indices[start_query_vec_idx]
+        print(f"✓ Selected start frame {start_query_frame_idx} with {best_start_matches} keypoint matches")
+        
+        print("\nFinding best end frame match with keypoint verification...")
+        sim_end = torch.cdist(query_vectors, reference_vectors[[-1]])
+        # Get top 5 candidates for end frame (sorted by place distance, best first)
+        top_end_distances, top_end_indices = torch.topk(sim_end.squeeze(), top_k, largest=False)
+        
+        print(f"Testing {top_k} candidates sorted by place recognition score (best to worst):")
+        
+        # Verify with keypoint matching
+        best_end_matches = 0
+        end_query_vec_idx = None
+        ref_end_img_path = reference_db[-1]['image_path']
+        
+        for i, idx in enumerate(top_end_indices):
+            query_vec_idx = idx.item()
+            query_frame_idx = query_indices[query_vec_idx]
+            query_img = self.frame_buffer[query_frame_idx]
+            
+            # Get detailed match info
+            num_matches, query_img_np, ref_img_rgb, keypoints0, keypoints1, matching_scores = self.matcher.count_keypoint_matches(
+                query_img, ref_end_img_path, return_details=True
+            )
+            
+            meets_threshold = num_matches >= self.config.min_keypoint_matches
+            status = "✓ VALID" if meets_threshold else "✗ BELOW THRESHOLD"
+            print(f"  Candidate {i+1} (rank #{i+1}): place_dist={top_end_distances[i].item():.4f}, keypoint_matches={num_matches} {status}")
+            
+            # Only consider candidates with enough matches
+            if meets_threshold and num_matches > best_end_matches:
+                best_end_matches = num_matches
+                end_query_vec_idx = query_vec_idx
+        
+        if end_query_vec_idx is None:
+            print(f"ERROR: No end frame candidate met the minimum threshold of {self.config.min_keypoint_matches} matches!")
+            return []
+        
         end_query_frame_idx = query_indices[end_query_vec_idx]
+        print(f"✓ Selected end frame {end_query_frame_idx} with {best_end_matches} keypoint matches")
+        
         if start_query_frame_idx > end_query_frame_idx:
             start_query_frame_idx, end_query_frame_idx = end_query_frame_idx, start_query_frame_idx
-        print(f"Best query frame indices: start={start_query_frame_idx}, end={end_query_frame_idx}")
-
-        # Save debug preview of the matched start/end pairs (query vs. reference)
-        try:
-            if getattr(self.config, 'create_debug_matches', False):
-                reference_db, _reference_vectors = self._unpack_reference_db(db_data)
-                save_localization_start_end_debug(self.config.database_path, reference_db, self.frame_buffer, start_query_frame_idx, end_query_frame_idx)
-        except Exception as e:
-            print(f"Warning: Could not save start/end relocalization debug previews: {e}")
+        
+        print("\n" + "="*70)
+        print(f"FINAL LOCALIZATION RESULTS:")
+        print(f"  ✓ Start frame: {start_query_frame_idx} with {best_start_matches} keypoint matches")
+        print(f"  ✓ End frame:   {end_query_frame_idx} with {best_end_matches} keypoint matches")
+        print(f"  Minimum threshold: {self.config.min_keypoint_matches} matches (both passed)")
+        print("="*70 + "\n")
 
         # 4. Add buffer around start/end and trim buffers
         overlap = self.config.relocalization_frame_overlap
@@ -351,27 +470,10 @@ class VisualSLAM:
             print("Warning: Computed empty query window. Aborting localization selection.")
             return []
 
-        # Optional GPS gate to ensure rough consistency between query ends and reference ends
-        if self.telemetry and hasattr(self, 'gps_ned') and self.gps_ned is not None and len(reference_db) >= 2:
-            try:
-                qs_tns = self.frametimes_ns[q_start]
-                qe_tns = self.frametimes_ns[q_end - 1]
-                if qs_tns in self.gps_ned and qe_tns in self.gps_ned:
-                    q_start_ned = np.array(self.gps_ned[qs_tns])
-                    q_end_ned = np.array(self.gps_ned[qe_tns])
-                    r_start_ned = reference_db[0].get('gps_ned', None)
-                    r_end_ned = reference_db[-1].get('gps_ned', None)
-                    if r_start_ned is not None and r_end_ned is not None:
-                        r_start_ned = r_start_ned.cpu().numpy() if isinstance(r_start_ned, torch.Tensor) else np.array(r_start_ned)
-                        r_end_ned = r_end_ned.cpu().numpy() if isinstance(r_end_ned, torch.Tensor) else np.array(r_end_ned)
-                        dist_start = np.linalg.norm(q_start_ned - r_start_ned)
-                        dist_end = np.linalg.norm(q_end_ned - r_end_ned)
-                        max_allowed = self.config.relocalization_gps_max_pair_distance_m
-                        if dist_start > max_allowed or dist_end > max_allowed:
-                            print(f"GPS gating failed: start {dist_start:.2f}m, end {dist_end:.2f}m exceed {max_allowed}m.")
-                            return []
-            except Exception as e:
-                print(f"Warning: GPS gating failed due to error: {e}. Proceeding without GPS gate.")
+        # Store initial reference indices for spatial matching in subsequent chunks
+        self.initial_ref_start_idx = 0  # Reference DB start index
+        self.initial_ref_end_idx = len(reference_db) - 1  # Reference DB end index
+        self.current_ref_idx = 0  # Will be updated as we process chunks
 
         # Trim internal buffers to reduce memory
         self.frame_buffer = self.frame_buffer[q_start:q_end]
@@ -499,7 +601,22 @@ class VisualSLAM:
             # Save chunk data and update database
             all_normals_for_chunk = [ground_normal] * len(query_predictions) if ground_normal is not None else [None] * len(query_predictions)
             all_plane_ds_for_chunk = [plane_d] * len(query_predictions) if plane_d is not None else [None] * len(query_predictions)
-            self._save_chunk_with_interpolation(i, chunk_start_idx, chunk_end_idx, processed_image_paths, query_predictions, query_paths, all_normals_for_chunk, all_plane_ds_for_chunk)
+            save_chunk_with_interpolation(
+                i, 
+                chunk_start_idx, 
+                chunk_end_idx, 
+                processed_image_paths, 
+                query_predictions, 
+                query_paths, 
+                all_normals_for_chunk, 
+                all_plane_ds_for_chunk,
+                self.config.output_dir,
+                self.config.max_depth_for_point_cloud,
+                self.config.stride,
+                self.config.video_path,
+                self.frametimes_ns,
+                self.frame_pos_buffer
+            )
 
             processed_chunk_data = self._process_chunk_and_update_db(
                 query_predictions, query_paths, ground_normal, plane_d, place_vectors_for_chunk)
@@ -518,9 +635,14 @@ class VisualSLAM:
                 self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
                 
             if self.config.create_debug_chunk_visualizations:
-                self._save_debug_chunk_visualization(i, query_predictions)
+                save_debug_chunk_visualization(i, query_predictions, self.config.output_dir, self.config.max_depth_for_point_cloud)
 
         overall_proc_time = time.time() - overall_start_time
+        
+        # --- Trim Query Trajectory Based on Spatial Distance to Reference ---
+        if relocalization_db is not None:
+            print("\n--- Trimming Query Trajectory Based on Spatial Distance ---")
+            database = self._trim_query_to_reference_coverage(database, relocalization_db)
         
         # --- Final Alignment and Database Save ---
         alignment_transform = None
@@ -560,23 +682,103 @@ class VisualSLAM:
 
         self._save_database(database, alignment_transform)
         
-        # Always save a trajectory-only PLY for the query reconstruction
-        try:
-            save_query_trajectory_and_normals(database, self.config.database_path)
-        except Exception as e:
-            print(f"Warning: Could not save trajectory/normals PLY: {e}")
+        # Save trajectory-only PLY for query reconstruction (only during relocalization)
+        if relocalization_db is not None:
+            try:
+                save_query_trajectory_and_normals(database, self.config.database_path)
+            except Exception as e:
+                print(f"Warning: Could not save trajectory/normals PLY: {e}")
 
         if relocalization_db is None and alignment_transform is not None:
             # Save the final transform for the point cloud processor and align chunks
             alignment_path = os.path.join(os.path.dirname(self.config.database_path), "alignment.pt")
             torch.save(alignment_transform, alignment_path)
             print(f"Saved final alignment transform to {alignment_path}")
-            self._save_chunks_for_visualization(database, alignment_transform)
+            save_chunks_for_visualization(self.config.output_dir, alignment_transform)
 
 
         print("\n--- Total Execution Summary ---")
         print(f"Processed {len(database)} frames in {overall_proc_time:.2f} seconds.")
 
+    def _trim_query_to_reference_coverage(self, database: List[Dict], relocalization_db_data: Tuple) -> List[Dict]:
+        """
+        Trims the query database to precise spatial coverage of the reference trajectory.
+        Finds the query frames closest to reference start/end poses and drops everything outside.
+        
+        Args:
+            database: Query reconstruction database with poses
+            relocalization_db_data: Reference database tuple (db, vectors)
+            
+        Returns:
+            Trimmed database containing only frames within reference coverage
+        """
+        if not database:
+            return database
+        
+        reference_db, _ = relocalization_db_data
+        
+        # Get reference start and end poses
+        ref_start_pose = reference_db[0]['camera_poses']
+        ref_end_pose = reference_db[-1]['camera_poses']
+        
+        if isinstance(ref_start_pose, torch.Tensor):
+            ref_start_pos = ref_start_pose[0, :3, 3]
+            ref_end_pos = ref_end_pose[0, :3, 3]
+        else:
+            ref_start_pos = torch.tensor(ref_start_pose[0][:3, 3])
+            ref_end_pos = torch.tensor(ref_end_pose[0][:3, 3])
+        
+        print(f"Reference trajectory: {len(reference_db)} frames")
+        print(f"  Start position: {ref_start_pos.cpu().numpy()}")
+        print(f"  End position: {ref_end_pos.cpu().numpy()}")
+        
+        # Calculate distances from reference start/end to all query poses
+        min_start_dist = float('inf')
+        min_end_dist = float('inf')
+        closest_start_idx = 0
+        closest_end_idx = len(database) - 1
+        
+        for idx, entry in enumerate(database):
+            query_pose = entry['camera_poses']
+            if isinstance(query_pose, torch.Tensor):
+                query_pos = query_pose[0, :3, 3] if query_pose.ndim == 3 else query_pose[:3, 3]
+            else:
+                query_pos = torch.tensor(query_pose[0][:3, 3] if len(query_pose.shape) == 3 else query_pose[:3, 3])
+            
+            # Distance to reference start
+            dist_to_start = torch.norm(query_pos - ref_start_pos).item()
+            if dist_to_start < min_start_dist:
+                min_start_dist = dist_to_start
+                closest_start_idx = idx
+            
+            # Distance to reference end
+            dist_to_end = torch.norm(query_pos - ref_end_pos).item()
+            if dist_to_end < min_end_dist:
+                min_end_dist = dist_to_end
+                closest_end_idx = idx
+        
+        # Ensure start comes before end
+        if closest_start_idx > closest_end_idx:
+            closest_start_idx, closest_end_idx = closest_end_idx, closest_start_idx
+            min_start_dist, min_end_dist = min_end_dist, min_start_dist
+        
+        print(f"\nQuery trajectory before trimming: {len(database)} frames")
+        print(f"  Closest to ref start: frame {closest_start_idx} at distance {min_start_dist:.3f}m")
+        print(f"  Closest to ref end: frame {closest_end_idx} at distance {min_end_dist:.3f}m")
+        
+        # Trim database
+        trimmed_database = database[closest_start_idx:closest_end_idx + 1]
+        
+        num_dropped_start = closest_start_idx
+        num_dropped_end = len(database) - closest_end_idx - 1
+        
+        print(f"\nQuery trajectory after trimming: {len(trimmed_database)} frames")
+        print(f"  Dropped {num_dropped_start} frames from start")
+        print(f"  Dropped {num_dropped_end} frames from end")
+        print(f"  Kept frames [{closest_start_idx}, {closest_end_idx}]")
+        
+        return trimmed_database
+    
     def _prepare_sequential_views(
         self,
         current_chunk_paths: List[str],
@@ -622,17 +824,71 @@ class VisualSLAM:
         
         return view_set, paths_in_view_set, first_overlap_pose
 
+    def _find_closest_reference_by_spatial_distance(self, query_pose, reference_db, search_start_idx=None, search_window=None):
+        """
+        Find the closest reference frame to a query pose based on spatial distance.
+        
+        Args:
+            query_pose: 4x4 camera pose tensor
+            reference_db: List of reference database entries
+            search_start_idx: Starting index in reference DB to search from (None = search all)
+            search_window: Number of frames to search around the start index (None = search all)
+            
+        Returns:
+            Tuple of (best_ref_idx, best_distance) or (None, float('inf'))
+        """
+        query_position = query_pose[0,:3, 3]  # Extract translation
+        
+        best_ref_idx = None
+        best_distance = float('inf')
+        
+        # Determine search range
+        if search_start_idx is None or search_window is None:
+            # Search all reference frames
+            search_start = 0
+            search_end = len(reference_db)
+        else:
+            # Search within window centered on search_start_idx
+            search_start = max(0, search_start_idx - search_window // 2)
+            search_end = min(search_start_idx + search_window, len(reference_db))
+        
+        for ref_idx in range(search_start, search_end):
+            ref_pose = reference_db[ref_idx]['camera_poses'][0]
+            if isinstance(ref_pose, torch.Tensor):
+                ref_position = ref_pose[:3, 3]
+            else:
+                ref_position = torch.tensor(ref_pose[:3, 3])
+            
+            distance = torch.norm(query_position - ref_position).item()
+            
+            if distance < best_distance:
+                best_distance = distance
+                best_ref_idx = ref_idx
+        
+        return best_ref_idx, best_distance
+    
     def _prepare_relocalization_views(
         self, current_chunk_paths: List[str], db_data: Tuple[List[Dict], torch.Tensor]
     ) -> Tuple[List[Dict], List[str], torch.Tensor, torch.Tensor]:
-        """Prepares views by finding matches in an existing database."""
-        reference_db, reference_vectors = db_data
-        view_set, paths_in_view_set = [], []
-        first_overlap_pose = None
+        """
+        Prepares views by adding reference priors based on spatial proximity.
         
-        print(f"Finding relocalization priors for the current chunk...")
-
-        # 1. Load current chunk images and get their place vectors
+        Strategy:
+        - First chunk: Add first N reference frames as priors (assumes query starts near beginning of reference)
+        - Subsequent chunks: Use last query pose to find closest reference, add N consecutive reference frames if within threshold
+        
+        Returns:
+            Tuple of (view_set, paths_in_view_set, first_overlap_pose, current_vectors)
+        """
+        reference_db, reference_vectors = db_data
+        view_set = []
+        paths_in_view_set = []
+        first_overlap_pose = None
+        current_vectors = None
+        
+        is_first_chunk = len(self.last_chunk_poses_for_fallback) == 0
+        
+        # Load current chunk images
         if self.config.video_path:
             current_views = self._get_views_from_buffer(current_chunk_paths)
         else:
@@ -642,122 +898,90 @@ class VisualSLAM:
                 size=self.target_size,
             )
         
-        # Reuse precomputed place vectors for video; compute only for image lists
-        if self.config.video_path:
-            current_vectors = []
-            for path in current_chunk_paths:
-                base = os.path.basename(path)
-                name, _sep, _ext = base.partition('.')
-                digits = ''.join([c for c in name if c.isdigit()])
-                frame_idx = int(digits)
-                current_vectors.append(torch.from_numpy(self.place_net_descriptors[frame_idx]).squeeze())
-            current_vectors = torch.stack(current_vectors)
-        else:
-            current_vectors = []
-            for view in current_views:
-                img_for_place_net = rgb(view['img'], view['data_norm_type'][0])[0] * 255
-                vector = torch.tensor(self.place_net(img_for_place_net).squeeze())
-                current_vectors.append(vector.squeeze())
-            current_vectors = torch.stack(current_vectors)
-
-        # 2. Find best matches in the database using L2 distance
-        similarities = torch.cdist(current_vectors, reference_vectors.cpu())
-        best_match_indices_for_all = torch.argmin(similarities, dim=1)
-        best_match_distances = similarities[torch.arange(similarities.shape[0]), best_match_indices_for_all]
-        
-        # 3. Filter matches based on thresholds
-        min_distance = best_match_distances.min() 
-        print("Min distance:", min_distance)
-        relative_threshold = min_distance * (1 + self.config.relocalization_threshold_percent / 100)
-        absolute_threshold = self.config.max_relocalization_threshold
-        
-        valid_indices_mask = (best_match_distances < relative_threshold) & (best_match_distances < absolute_threshold)
-        
-        valid_query_indices = torch.where(valid_indices_mask)[0].tolist()
-        
-        print(f"Found {len(valid_query_indices)} potential high-quality matches for this chunk.")
-
-        # 4. Strategically select the first and last valid matches to use as priors
-        priors_to_use = []
-        if len(valid_query_indices) > 0:
-            first_match_idx = valid_query_indices[0]
-            last_match_idx = valid_query_indices[-1]
+        # ========== FIRST CHUNK: Add First N Reference Frames ==========
+        if is_first_chunk:
+            print(f"[Chunk 1] Adding first {self.config.num_reference_priors} reference frames as priors...")
             
-            priors_to_use.append(first_match_idx)
-            if first_match_idx != last_match_idx:
-                priors_to_use.append(last_match_idx)
+            # Add first N consecutive reference frames as priors
+            num_priors_to_add = min(self.config.num_reference_priors, len(reference_db))
+            for i in range(num_priors_to_add):
+                db_entry = reference_db[i]
+                db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
+                ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
+                if not isinstance(ref_intrinsics, torch.Tensor):
+                    ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
+                db_view.update({
+                    "intrinsics": ref_intrinsics,
+                    "camera_poses": db_entry['camera_poses'].to(self.device)
+                })
+                view_set.append(db_view)
+                paths_in_view_set.append(db_entry['image_path'])
+                
+                if i == 0:
+                    first_overlap_pose = db_entry['camera_poses'].to(self.device)
+            
+            # Store reference index for next chunk
+            self.current_ref_idx = num_priors_to_add - 1
+            print(f"  ✓ Added reference frames 0 to {num_priors_to_add - 1}")
         
-        # 5. Add the selected database entries as priors
-        added_db_indices = set()
-        if priors_to_use:
-            print(f"Selected {len(priors_to_use)} priors (first and last valid matches) for alignment.")
-            for query_idx in priors_to_use:
-                db_idx = best_match_indices_for_all[query_idx].item()
-                if db_idx not in added_db_indices:
-                    db_entry = reference_db[db_idx]
-                    db_image_path = db_entry['image_path']
-                    db_pose = db_entry['camera_poses'].to(self.device)
-                    
-                    if self.config.video_path:
-                        # This part is tricky, relocalization with video requires a way to map db paths to frames
-                        # For now, we assume db paths are image files and load them.
-                        # A more robust solution would be needed for pure video-to-video relocalization.
-                        print(f"Warning: Relocalization from a video sequence against a database with file paths ({db_image_path}).")
-                    
-                    db_view = load_images([db_image_path], resize_mode="fixed_size", size=self.target_size)[0]
-                    # Prefer stored intrinsics from the reference DB if present
-                    ref_intrinsics = db_entry.get('intrinsics', None)
-                    if ref_intrinsics is not None:
-                        if isinstance(ref_intrinsics, torch.Tensor):
-                            intr = ref_intrinsics
-                        else:
-                            intr = torch.tensor(ref_intrinsics, dtype=torch.float32)
-                    else:
-                        intr = self.intrinsics
-                    db_view.update({"intrinsics": intr, "camera_poses": db_pose})
-                    
-                    if first_overlap_pose is None:
-                        first_overlap_pose = db_pose
-                    
+        # ========== SUBSEQUENT CHUNKS: Use Spatial Distance Matching ==========
+        else:
+            print(f"[Chunk N] Using spatial distance to find closest reference...")
+            
+            # Get last query pose from previous chunk
+            last_query_path = list(self.last_chunk_poses_for_fallback.keys())[-1]
+            last_query_pose = self.last_chunk_poses_for_fallback[last_query_path]
+            
+            # Find closest reference pose across ALL reference frames
+            ref_idx, distance = self._find_closest_reference_by_spatial_distance(
+                last_query_pose, reference_db, search_start_idx=None, search_window=None
+            )
+            
+            print(f"  Closest reference frame: {ref_idx} at distance {distance:.3f}m")
+            
+            # If within threshold: add reference priors
+            if distance <= self.config.spatial_distance_threshold_m:
+                print(f"  ✓ Within threshold ({self.config.spatial_distance_threshold_m}m), adding {self.config.num_reference_priors} reference priors")
+                
+                # Add N consecutive reference frames as priors
+                num_priors_to_add = min(self.config.num_reference_priors, len(reference_db) - ref_idx)
+                for i in range(num_priors_to_add):
+                    idx = ref_idx + i
+                    db_entry = reference_db[idx]
+                    db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
+                    ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
+                    if not isinstance(ref_intrinsics, torch.Tensor):
+                        ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
+                    db_view.update({
+                        "intrinsics": ref_intrinsics,
+                        "camera_poses": db_entry['camera_poses'].to(self.device)
+                    })
                     view_set.append(db_view)
-                    paths_in_view_set.append(db_image_path)
-                    added_db_indices.add(db_idx)
+                    paths_in_view_set.append(db_entry['image_path'])
                     
-                    # Create debug image for the selected priors
-                    if self.config.create_debug_matches:
-                        query_image_id = current_chunk_paths[query_idx]
-                        save_query_db_match_debug(self.config.database_path, self.frame_buffer, 
-                            self.chunk_idx_for_debug, query_idx, query_image_id, db_image_path)
-        else:
-            print("No valid relocalization matches found for this chunk. Proceeding with sequential alignment.")
-            # Fallback to sequential alignment if no matches are found
-            view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback, self.last_chunk_depth_z_for_fallback)
-            return view_set, paths_in_view_set, first_overlap_pose, current_vectors
-            
-        # If no valid matches are found, we'll try to align sequentially
-        if not valid_query_indices:
-            print("No valid relocalization matches found for this chunk. Will attempt sequential alignment.")
-        else:
-             # Use the pose of the very first valid database match as the anchor for alignment
-            first_db_pose = view_set[0]["camera_poses"]
-            first_overlap_pose = first_db_pose.to(self.device)
-            print(f"Added {len(view_set)} unique database views as priors.")
-
-        # --- 2. Add Priors from Previous Query Chunk (Sequential Overlap) ---
+                    if i == 0:
+                        first_overlap_pose = db_entry['camera_poses'].to(self.device)
+                
+                self.current_ref_idx = ref_idx + num_priors_to_add - 1
+                print(f"  Added reference frames {ref_idx} to {ref_idx + num_priors_to_add - 1}")
+            else:
+                print(f"  ✗ Distance {distance:.3f}m exceeds threshold, continuing sequential reconstruction")
+        
+        # ========== Add Sequential Overlap from Previous Query Chunk ==========
         overlapping_sequential_paths = [
             p for p in current_chunk_paths 
             if p in self.last_chunk_poses_for_fallback and p not in paths_in_view_set
         ]
-
+        
         if overlapping_sequential_paths:
-            print(f"Adding {len(overlapping_sequential_paths)} sequential views from previous query chunk as priors.")
+            print(f"  Adding {len(overlapping_sequential_paths)} sequential overlap views from previous query chunk")
             overlap_views = self._get_views_from_buffer(overlapping_sequential_paths)
             for i, view in enumerate(overlap_views):
                 path = overlapping_sequential_paths[i]
                 pose = self.last_chunk_poses_for_fallback[path]
                 depth_z = self.last_chunk_depth_z_for_fallback[path]
                 view.update({
-                    "camera_poses": pose, 
+                    "camera_poses": pose,
                     "intrinsics": self.intrinsics,
                     "is_metric_scale": torch.tensor([True], device=self.device),
                     "depth_z": depth_z
@@ -765,22 +989,22 @@ class VisualSLAM:
             view_set.extend(overlap_views)
             paths_in_view_set.extend(overlapping_sequential_paths)
             
-            # If no global DB priors were found, use the first sequential one for alignment.
-            if first_overlap_pose is None:
-                print("Using first sequential overlap view as alignment anchor.")
+            # If no reference priors were found, use first sequential overlap for alignment
+            if first_overlap_pose is None and overlapping_sequential_paths:
                 first_overlap_pose = self.last_chunk_poses_for_fallback[overlapping_sequential_paths[0]]
-
-        # --- 3. Add all new (unposed) views from the current chunk ---
-        new_query_paths = [p for p in current_chunk_paths if p not in paths_in_view_set]
+                print(f"  Using first sequential overlap as alignment anchor")
         
-        # We need to find the original views for these paths to add them
+        # ========== Add New (Unposed) Query Views ==========
+        new_query_paths = [p for p in current_chunk_paths if p not in paths_in_view_set]
         for path in new_query_paths:
             original_idx = current_chunk_paths.index(path)
             view = current_views[original_idx]
             view["intrinsics"] = self.intrinsics
             view_set.append(view)
         paths_in_view_set.extend(new_query_paths)
-            
+        
+        print(f"  Total views in set: {len(view_set)} ({len(view_set) - len(new_query_paths)} priors, {len(new_query_paths)} new)")
+        
         return view_set, paths_in_view_set, first_overlap_pose, current_vectors
 
     def _align_saved_chunks(self, alignment_transform: torch.Tensor):
@@ -981,346 +1205,3 @@ class VisualSLAM:
         except Exception as e:
             print(f"Error saving database: {e}")
 
-    def _save_chunks_for_visualization(self, database, alignment_transform):
-        """Saves the point clouds for each frame for later visualization."""
-        print("Saving point clouds for visualization...")
-        chunk_dirs = sorted(glob.glob(os.path.join(self.config.output_dir, "chunk_*")))
-        transform_np = alignment_transform.cpu().numpy() if alignment_transform is not None else np.eye(4)
-
-        for chunk_dir in chunk_dirs:
-            try:
-                metadata_file = os.path.join(chunk_dir, "metadata.pt")
-                pcd_file = os.path.join(chunk_dir, "point_cloud.npz")
-
-                if not (os.path.exists(metadata_file) and os.path.exists(pcd_file)):
-                    continue
-                
-                # Load data
-                metadata = torch.load(metadata_file, map_location="cpu", weights_only=False)
-                pcd_data = np.load(pcd_file)
-
-                # --- Transform Poses ---
-                original_poses = metadata['camera_poses']
-                aligned_poses = [torch.from_numpy(transform_np) @ pose for pose in original_poses]
-                metadata['camera_poses'] = aligned_poses
-
-                # --- Transform Normals ---
-                if 'ground_normals' in metadata:
-                    R_align = transform_np[:3, :3]
-                    original_normals = [n.numpy() if isinstance(n, torch.Tensor) else n for n in metadata['ground_normals']]
-                    aligned_normals = [R_align @ n if n is not None else None for n in original_normals]
-                    metadata['ground_normals'] = aligned_normals
-                
-                metadata['is_aligned'] = True
-                torch.save(metadata, metadata_file)
-
-                # --- Transform Points ---
-                pts3d = pcd_data['pts3d']
-                pts_hom = np.hstack((pts3d, np.ones((pts3d.shape[0], 1))))
-                aligned_pts3d = (transform_np @ pts_hom.T).T[:, :3]
-
-                np.savez_compressed(
-                    pcd_file,
-                    pts3d=aligned_pts3d,
-                    colors=pcd_data['colors']
-                )
-            except Exception as e:
-                print(f"Warning: Could not align chunk {os.path.basename(chunk_dir)}: {e}")
-        print("Finished aligning chunk files.")
-
-    def _save_chunk(self, chunk_idx, predictions, all_poses, all_paths, is_reconstructed_flags, all_normals, all_plane_ds, frametimes_ns=None, frame_pos=None):
-        """Saves the processed data for a chunk to a .pt file."""
-        if not predictions:
-            return
-
-        # Points, colors, and confidences are only from the *reconstructed* views
-        all_pts3d = torch.cat([p['pts3d'].reshape(-1, 3) for p in predictions], dim=0)
-        all_pts3d_cam = torch.cat([p['pts3d_cam'].reshape(-1, 3) for p in predictions], dim=0)
-        all_colors = torch.cat([p['img_no_norm'].reshape(-1, 3) for p in predictions], dim=0)
-        all_masks = torch.cat([p['mask'].reshape(-1) for p in predictions], dim=0)
-
-        # Apply masks to filter points before saving
-        all_pts3d = all_pts3d[all_masks]
-        all_pts3d_cam = all_pts3d_cam[all_masks]
-        all_colors = all_colors[all_masks]
-
-        # Apply depth filter
-        depth_mask = all_pts3d_cam[:, 2] < self.config.max_depth_for_point_cloud
-        all_pts3d = all_pts3d[depth_mask]
-        all_colors = all_colors[depth_mask]
-        
-        chunk_dir = os.path.join(self.config.output_dir, f"chunk_{chunk_idx:04d}")
-        os.makedirs(chunk_dir, exist_ok=True)
-        
-        # Save point cloud data as a compressed numpy array for efficiency
-        pcd_path = os.path.join(chunk_dir, "point_cloud.npz")
-        np.savez_compressed(
-            pcd_path,
-            pts3d=all_pts3d.cpu().numpy(),
-            colors=(all_colors * 255).byte().cpu().numpy()
-        )
-
-        # Save metadata separately
-        metadata = {
-            'camera_poses': [p.cpu() for p in all_poses],
-            'is_reconstructed': is_reconstructed_flags,
-            'ground_normals': all_normals,
-            'plane_ds': all_plane_ds,
-        }
-        if not self.config.video_path:
-            metadata['image_paths'] = all_paths
-        if frametimes_ns:
-            metadata['frametimes_ns'] = frametimes_ns
-        if frame_pos:
-            metadata['frame_pos'] = frame_pos
-            
-        torch.save(metadata, os.path.join(chunk_dir, "metadata.pt"))
-        print(f"Saved chunk data for chunk {chunk_idx} to {chunk_dir}")
-
-    def _save_chunk_with_interpolation(self, chunk_idx, chunk_start_idx, chunk_end_idx, all_processed_paths, predictions, pred_paths, all_normals, all_plane_ds):
-        """
-        Handles pose interpolation if a stride is used and saves the complete data for a chunk.
-        """
-        # --- Handle Pose Interpolation ---
-        if self.config.stride > 1 and len(pred_paths) > 1:
-            full_chunk_paths = all_processed_paths[chunk_start_idx:chunk_end_idx]
-            key_frame_poses = [p['camera_poses'][0].cpu().numpy() for p in predictions]
-            
-            try:
-                key_frame_indices = [full_chunk_paths.index(p) for p in pred_paths]
-            except ValueError:
-                # Fallback if a path isn't found, though this shouldn't happen
-                poses_to_save = [p['camera_poses'] for p in predictions]
-                paths_to_save = pred_paths
-                is_reconstructed = [True] * len(predictions)
-            else:
-                slerp = Slerp(key_frame_indices, Rotation.from_matrix([p[:3, :3] for p in key_frame_poses]))
-                key_translations = np.array([p[:3, 3] for p in key_frame_poses])
-                
-                min_idx, max_idx = min(key_frame_indices), max(key_frame_indices)
-                interp_indices = np.arange(min_idx, max_idx + 1)
-                
-                interp_rotations = slerp(interp_indices).as_matrix()
-                interp_translations = np.array([np.interp(interp_indices, key_frame_indices, key_translations[:, i]) for i in range(3)]).T
-                
-                interpolated_poses_map = {}
-                for i, frame_idx in enumerate(interp_indices):
-                    pose = np.eye(4)
-                    pose[:3, :3] = interp_rotations[i]
-                    pose[:3, 3] = interp_translations[i]
-                    interpolated_poses_map[frame_idx] = torch.from_numpy(pose).float().unsqueeze(0)
-
-                poses_to_save, paths_to_save, is_reconstructed = [], [], []
-                for i, path in enumerate(full_chunk_paths):
-                    if min_idx <= i <= max_idx:
-                        poses_to_save.append(interpolated_poses_map[i])
-                        paths_to_save.append(path)
-                        is_reconstructed.append(i in key_frame_indices)
-        else:
-            poses_to_save = [p['camera_poses'] for p in predictions]
-            paths_to_save = pred_paths
-            is_reconstructed = [True] * len(predictions)
-            
-        frametimes_ns_to_save = []
-        frame_pos_to_save = []
-        if self.config.video_path:
-            # When processing a video, paths are identifiers like "frame_123"
-            # We extract the index from the identifier to get the real metadata.
-            for path in paths_to_save:
-                try:
-                    base = os.path.basename(path)
-                    name, _sep, _ext = base.partition('.')
-                    digits = ''.join([c for c in name if c.isdigit()])
-                    frame_idx = int(digits)
-                    original_list_idx = all_processed_paths.index(path)
-                    frametimes_ns_to_save.append(self.frametimes_ns[original_list_idx])
-                    frame_pos_to_save.append(self.frame_pos_buffer[original_list_idx])
-                except (ValueError, IndexError) as e:
-                    print(f"Warning: Could not parse frame index from path '{path}'. Skipping metadata. Error: {e}")
-
-        # Note: Normals are not interpolated, they are saved per-chunk and associated with the keyframes.
-        # This logic assumes normals are constant for the reconstructed part of the chunk.
-        self._save_chunk(chunk_idx, predictions, poses_to_save, paths_to_save, is_reconstructed, all_normals, all_plane_ds, frametimes_ns_to_save, frame_pos_to_save)
-
-    def _save_debug_chunk_visualization(self, chunk_idx, predictions):
-        """Saves the point cloud and trajectory for a single chunk for debugging."""
-        if not predictions:
-            return
-
-        debug_dir = os.path.join(self.config.output_dir, "debug_chunks")
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # --- Create Point Cloud ---
-        all_pts3d = torch.cat([p['pts3d'].reshape(-1, 3) for p in predictions], dim=0)
-        all_pts3d_cam = torch.cat([p['pts3d_cam'].reshape(-1, 3) for p in predictions], dim=0)
-        all_colors = torch.cat([p['img_no_norm'].reshape(-1, 3) for p in predictions], dim=0)
-        all_masks = torch.cat([p['mask'].reshape(-1) for p in predictions], dim=0)
-
-        # Apply confidence filter
-        all_pts3d = all_pts3d[all_masks]
-        all_pts3d_cam = all_pts3d_cam[all_masks]
-        all_colors = all_colors[all_masks]
-
-        # Apply depth filter (using world Z coordinate)
-        depth_mask = all_pts3d_cam[:, 2] < self.config.max_depth_for_point_cloud
-        all_pts3d = all_pts3d[depth_mask]
-        all_colors = all_colors[depth_mask]
-
-        if all_pts3d.shape[0] == 0:
-            print(f"Debug chunk {chunk_idx}: No points left after filtering.")
-            return
-
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(all_pts3d.cpu().numpy())
-        pcd.colors = o3d.utility.Vector3dVector(all_colors.cpu().numpy())
-        
-        pcd_path = os.path.join(debug_dir, f"debug_chunk_{chunk_idx:04d}_pcd.ply")
-        o3d.io.write_point_cloud(pcd_path, pcd)
-
-        # --- Estimate and Visualize Ground Normal ---
-        try:
-            plane_model, inliers = pcd.segment_plane(distance_threshold=0.1, ransac_n=3, num_iterations=1000)
-            [a, b, c, d] = plane_model
-            ground_normal = np.array([a, b, c])
-            
-            # Ensure the normal points upwards (positive Y)
-            if ground_normal[1] < 0:
-                ground_normal = -ground_normal
-
-            print(f"Debug chunk {chunk_idx}: Estimated ground normal: {ground_normal}")
-
-            # Get a point on the plane to draw the normal from (using the pcd center)
-            center_point = pcd.get_center()
-            
-            # Create a line representing the normal
-            normal_line = o3d.geometry.LineSet()
-            normal_line.points = o3d.utility.Vector3dVector([center_point, center_point + ground_normal * 2.0]) # 2-meter long line
-            normal_line.lines = o3d.utility.Vector2iVector([[0, 1]])
-            normal_line.colors = o3d.utility.Vector3dVector([[1, 0, 1]]) # Magenta
-
-            normal_path = os.path.join(debug_dir, f"debug_chunk_{chunk_idx:04d}_normal.ply")
-            o3d.io.write_line_set(normal_path, normal_line)
-
-        except Exception as e:
-            print(f"Debug chunk {chunk_idx}: Could not estimate ground normal. {e}")
-
-        # --- Create Trajectory ---
-        camera_poses = [p['camera_poses'][0].cpu().numpy() for p in predictions]
-        camera_positions = [pose[:3, 3] for pose in camera_poses]
-        lines = [[i, i + 1] for i in range(len(camera_positions) - 1)]
-        
-        if not lines:
-            print(f"Debug chunk {chunk_idx}: Not enough poses for a trajectory.")
-            return
-
-        # Save trajectory as a dense point cloud PLY for easy visualization
-        points_on_lines = []
-        for i in range(len(camera_positions) - 1):
-            start = camera_positions[i]
-            end = camera_positions[i+1]
-            # Add 100 points per line segment
-            points_on_lines.extend(np.linspace(start, end, 100))
-        
-        if not points_on_lines:
-            return
-            
-        traj_pcd = o3d.geometry.PointCloud()
-        traj_pcd.points = o3d.utility.Vector3dVector(points_on_lines)
-        traj_pcd.paint_uniform_color([1, 0, 0]) # Red
-
-        traj_path = os.path.join(debug_dir, f"debug_chunk_{chunk_idx:04d}_traj.ply")
-        o3d.io.write_point_cloud(traj_path, traj_pcd)
-
-        print(f"Saved debug visualization for chunk {chunk_idx} to {debug_dir}")
-
-    def _save_query_trajectory_and_normals(self, database: List[Dict]):
-        """
-        Save a trajectory-only PLY for the current run and an auxiliary normals PLY.
-        Trajectory is saved as a dense point cloud along the camera path for viewer compatibility.
-        Normals are visualized as short colored line segments sampled into points and saved as PLY.
-        """
-        if not database:
-            print("No database entries to save trajectory.")
-            return
-
-        try:
-            # Extract camera positions and optional normals
-            camera_positions = []
-            per_frame_normals = []
-            for entry in database:
-                pose = entry['camera_poses']
-                if isinstance(pose, torch.Tensor):
-                    pose_np = pose[0].detach().cpu().numpy()
-                else:
-                    pose_np = pose[0]
-                camera_positions.append(pose_np[:3, 3])
-                nrm = entry.get('ground_normal', None)
-                if isinstance(nrm, torch.Tensor):
-                    nrm = nrm.detach().cpu().numpy()
-                per_frame_normals.append(nrm)
-
-            if len(camera_positions) < 2:
-                print("Not enough poses to form a trajectory.")
-                return
-
-            # Determine normal line length from median step size
-            steps = [np.linalg.norm(camera_positions[i+1] - camera_positions[i]) for i in range(len(camera_positions)-1)]
-            median_step = np.median(steps) if steps else 1.0
-            normal_length = float(max(0.25 * median_step, 0.1))
-
-            # Build dense point cloud along the trajectory lines
-            num_points_per_segment = 100
-            traj_pts = []
-            traj_cols = []
-            traj_color = np.array([0.0, 0.0, 1.0])
-            for i in range(len(camera_positions) - 1):
-                start = camera_positions[i]
-                end = camera_positions[i + 1]
-                seg_points = np.linspace(start, end, num_points_per_segment)
-                seg_colors = np.tile(traj_color, (num_points_per_segment, 1))
-                traj_pts.append(seg_points)
-                traj_cols.append(seg_colors)
-
-            if not traj_pts:
-                print("No segments to save for trajectory.")
-                return
-
-            traj_pts = np.concatenate(traj_pts, axis=0)
-            traj_cols = np.concatenate(traj_cols, axis=0)
-
-            # Build dense points for normals (optional)
-            normal_pts = []
-            normal_cols = []
-            normal_color = np.array([0.0, 1.0, 0.0])
-            for i, pos in enumerate(camera_positions):
-                nrm = per_frame_normals[i] if i < len(per_frame_normals) else None
-                if nrm is None:
-                    continue
-                end = pos + nrm * normal_length
-                seg_points = np.linspace(pos, end, 20)
-                seg_colors = np.tile(normal_color, (seg_points.shape[0], 1))
-                normal_pts.append(seg_points)
-                normal_cols.append(seg_colors)
-
-            # Save PLYs next to the database
-            out_dir = os.path.dirname(self.config.database_path) if self.config.database_path else self.config.output_dir
-            os.makedirs(out_dir, exist_ok=True)
-
-            # Trajectory
-            traj_pcd = o3d.geometry.PointCloud()
-            traj_pcd.points = o3d.utility.Vector3dVector(traj_pts)
-            traj_pcd.colors = o3d.utility.Vector3dVector(traj_cols)
-            traj_path = os.path.join(out_dir, "query_trajectory_only.ply")
-            o3d.io.write_point_cloud(traj_path, traj_pcd)
-            print(f"Saved trajectory-only PLY to {traj_path}")
-
-            # Normals (if any)
-            if normal_pts:
-                normals_pcd = o3d.geometry.PointCloud()
-                normals_pcd.points = o3d.utility.Vector3dVector(np.concatenate(normal_pts, axis=0))
-                normals_pcd.colors = o3d.utility.Vector3dVector(np.concatenate(normal_cols, axis=0))
-                normals_path = os.path.join(out_dir, "query_normals.ply")
-                o3d.io.write_point_cloud(normals_path, normals_pcd)
-                print(f"Saved normals PLY to {normals_path}")
-        except Exception as e:
-            print(f"Warning: Failed to save trajectory/normals: {e}")
