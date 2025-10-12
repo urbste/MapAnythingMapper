@@ -598,16 +598,28 @@ class VisualSLAM:
             except Exception as e:
                 print(f"Chunk {i}: Could not estimate ground plane, will use fallback. {e}")
 
+            # --- Trim Overlap from End (except for last chunk) to avoid duplicates ---
+            is_last_chunk = (i == num_chunks - 1)
+            if not is_last_chunk and len(query_predictions) > self.config.overlap_size:
+                # Drop the last overlap_size frames - they'll be saved with the next chunk
+                trim_idx = len(query_predictions) - self.config.overlap_size
+                query_predictions_to_save = query_predictions[:trim_idx]
+                query_paths_to_save = query_paths[:trim_idx]
+                print(f"  Trimming last {self.config.overlap_size} overlap frames from chunk (will be in next chunk)")
+            else:
+                query_predictions_to_save = query_predictions
+                query_paths_to_save = query_paths
+
             # Save chunk data and update database
-            all_normals_for_chunk = [ground_normal] * len(query_predictions) if ground_normal is not None else [None] * len(query_predictions)
-            all_plane_ds_for_chunk = [plane_d] * len(query_predictions) if plane_d is not None else [None] * len(query_predictions)
+            all_normals_for_chunk = [ground_normal] * len(query_predictions_to_save) if ground_normal is not None else [None] * len(query_predictions_to_save)
+            all_plane_ds_for_chunk = [plane_d] * len(query_predictions_to_save) if plane_d is not None else [None] * len(query_predictions_to_save)
             save_chunk_with_interpolation(
                 i, 
                 chunk_start_idx, 
                 chunk_end_idx, 
                 processed_image_paths, 
-                query_predictions, 
-                query_paths, 
+                query_predictions_to_save, 
+                query_paths_to_save, 
                 all_normals_for_chunk, 
                 all_plane_ds_for_chunk,
                 self.config.output_dir,
