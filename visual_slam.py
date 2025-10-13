@@ -272,7 +272,12 @@ class VisualSLAM:
         #self.map_anything = torch.compile(self.map_anything) #, backend="tensorrt"
         
         # Initialize matcher for keypoint matching and verification
-        self.matcher = Matcher(device=self.device, keypoint_matching_threshold=self.config.keypoint_matching_threshold)
+        # max_resolution=512 for faster matching (default is 640)
+        self.matcher = Matcher(
+            device=self.device, 
+            keypoint_matching_threshold=self.config.keypoint_matching_threshold,
+            max_resolution=320  # Lower resolution = faster matching
+        )
     
     def run_slam_for_sequence(self):
         """Runs the standard sequential SLAM pipeline for a new video sequence."""
@@ -465,8 +470,10 @@ class VisualSLAM:
             print(f"\n--- Processing Chunk {i+1}/{num_chunks} ---")
             
             place_vectors_for_chunk = None
+            last_ref_pose = None
+            last_ref_idx = -1
             if relocalization_db:
-                view_set, paths_in_view_set, first_overlap_pose, place_vectors_for_chunk = self._prepare_relocalization_views(current_chunk_paths, relocalization_db)
+                view_set, paths_in_view_set, first_overlap_pose, place_vectors_for_chunk, last_ref_pose, last_ref_idx = self._prepare_relocalization_views(current_chunk_paths, relocalization_db)
             else:
                 view_set, paths_in_view_set, first_overlap_pose = self._prepare_sequential_views(current_chunk_paths, self.last_chunk_poses_for_fallback, self.last_chunk_depth_z_for_fallback)
 
@@ -490,13 +497,23 @@ class VisualSLAM:
                 edge_normal_threshold=5.0,
                 edge_depth_threshold=0.03,
                 apply_confidence_mask=True,
-                confidence_percentile=50,
+                confidence_percentile=20,
             )
             
+            # Align query reconstruction to global frame
+            # Strategy: Always use FIRST pose in view_set (index 0)
+            # - Chunk 1: First pose is first reference frame
+            # - Chunk 2+: First pose is first query overlap frame
             if first_overlap_pose is not None:
+                is_first_chunk = i == 0
+                chunk_label = f"Chunk {i+1}"
+                print(f"  [{chunk_label}] Aligning using first pose in view_set (index 0)")
+                
                 new_first_pose = predictions[0]['camera_poses']
                 transform = first_overlap_pose.to(self.device) @ torch.inverse(new_first_pose)
                 predictions = self._apply_transform_to_chunk(predictions, transform)
+            else:
+                print(f"  Warning: No overlap pose found for chunk {i+1}, skipping alignment")
 
             # Filter for query sequence data
             query_predictions, query_paths = [], []
@@ -560,21 +577,21 @@ class VisualSLAM:
                 image_shape
             )
 
+            # Add only non-overlapping frames to database
             processed_chunk_data = self._process_chunk_and_update_db(
-                query_predictions, query_paths, ground_normal, plane_d, place_vectors_for_chunk)
+                query_predictions_to_save, query_paths_to_save, ground_normal, plane_d, place_vectors_for_chunk)
             database.extend(processed_chunk_data)
 
             # --- Update Last Chunk Poses for Next Overlap ---
+            # Store ALL frames (including overlap) for next chunk to use as priors
             # Use original query paths as keys to preserve overlap identity across chunks
             self.last_chunk_poses_for_fallback.clear()
             self.last_chunk_depth_z_for_fallback.clear()
-            for idx, entry in enumerate(processed_chunk_data):
+            for idx, pred in enumerate(query_predictions):
                 if idx < len(query_paths):
                     key = query_paths[idx]
-                else:
-                    key = entry["image_path"]
-                self.last_chunk_poses_for_fallback[key] = entry["camera_poses"]
-                self.last_chunk_depth_z_for_fallback[key] = entry["depth_z"]
+                    self.last_chunk_poses_for_fallback[key] = pred["camera_poses"]
+                    self.last_chunk_depth_z_for_fallback[key] = pred["depth_z"]
                 
             if self.config.create_debug_chunk_visualizations:
                 save_debug_chunk_visualization(i, query_predictions, self.config.output_dir, self.config.max_depth_for_point_cloud)
@@ -588,39 +605,39 @@ class VisualSLAM:
         
         # --- Final Alignment and Database Save ---
         alignment_transform = None
-        if relocalization_db is None:
-            # Only run GPS/gravity alignment for standalone query reconstructions.
-            if self.telemetry and self.gravity is not None:
-                # 1. Align to Gravity
-                gravity_transform = align_reconstruction_to_gravity(database, self.gravity, self.frametimes_ns, self.device)
+        # if relocalization_db is None:
+        #     # Only run GPS/gravity alignment for standalone query reconstructions.
+        #     if self.telemetry and self.gravity is not None:
+        #         # 1. Align to Gravity
+        #         gravity_transform = align_reconstruction_to_gravity(database, self.gravity, self.frametimes_ns, self.device)
                 
-                if gravity_transform is not None:
-                    # Create a temporary database aligned to gravity for subsequent alignments
-                    db_grav_aligned = [{'camera_poses': gravity_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in database]
+        #         if gravity_transform is not None:
+        #             # Create a temporary database aligned to gravity for subsequent alignments
+        #             db_grav_aligned = [{'camera_poses': gravity_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in database]
 
-                    # 2. Align to GPS direction in the XY plane (zero_z=True)
-                    gps_xy_transform = align_reconstruction_to_gps_direction(db_grav_aligned, self.gps_ned, self.frametimes_ns, True, self.device)
+        #             # 2. Align to GPS direction in the XY plane (zero_z=True)
+        #             gps_xy_transform = align_reconstruction_to_gps_direction(db_grav_aligned, self.gps_ned, self.frametimes_ns, True, self.device)
 
-                    if gps_xy_transform is not None:
-                        # Combine gravity and XY alignment
-                        alignment_transform = gps_xy_transform @ gravity_transform
+        #             if gps_xy_transform is not None:
+        #                 # Combine gravity and XY alignment
+        #                 alignment_transform = gps_xy_transform @ gravity_transform
                         
-                        # Create a temporary database also aligned in the XY plane for the final step
-                        db_xy_aligned = [{'camera_poses': gps_xy_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in db_grav_aligned]
+        #                 # Create a temporary database also aligned in the XY plane for the final step
+        #                 db_xy_aligned = [{'camera_poses': gps_xy_transform.cpu() @ entry['camera_poses'], 'image_path': entry['image_path']} for entry in db_grav_aligned]
 
-                        # 3. Perform final full 3D alignment (zero_z=False)
-                        final_gps_transform = align_reconstruction_to_gps_direction(db_xy_aligned, self.gps_ned, self.frametimes_ns, False, self.device)
+        #                 # 3. Perform final full 3D alignment (zero_z=False)
+        #                 final_gps_transform = align_reconstruction_to_gps_direction(db_xy_aligned, self.gps_ned, self.frametimes_ns, False, self.device)
 
-                        if final_gps_transform is not None:
-                            # Combine all transforms: T_final = T_gps_full @ T_gps_xy @ T_gravity
-                            alignment_transform = final_gps_transform @ alignment_transform
-                    else:
-                        # Fallback to just gravity alignment if GPS XY fails
-                        alignment_transform = gravity_transform
-            else:
-                # Fallback for sequences without telemetry
-                print("No telemetry or gravity data available, attempting simple GPS direction alignment.")
-                alignment_transform = align_reconstruction_to_gps_direction(database, self.gps_ned, self.frametimes_ns, True, self.device)
+        #                 if final_gps_transform is not None:
+        #                     # Combine all transforms: T_final = T_gps_full @ T_gps_xy @ T_gravity
+        #                     alignment_transform = final_gps_transform @ alignment_transform
+        #             else:
+        #                 # Fallback to just gravity alignment if GPS XY fails
+        #                 alignment_transform = gravity_transform
+        #     else:
+        #         # Fallback for sequences without telemetry
+        #         print("No telemetry or gravity data available, attempting simple GPS direction alignment.")
+        #         alignment_transform = align_reconstruction_to_gps_direction(database, self.gps_ned, self.frametimes_ns, True, self.device)
 
         self._save_database(database, alignment_transform)
         
@@ -657,7 +674,7 @@ class VisualSLAM:
         if not database:
             return database
         
-        reference_db, _ = relocalization_db_data
+        reference_db = relocalization_db_data
         
         # Get reference start and end poses
         ref_start_pose = reference_db[0]['camera_poses']
@@ -797,11 +814,12 @@ class VisualSLAM:
         for ref_idx in range(search_start, search_end):
             ref_pose = reference_db[ref_idx]['camera_poses'][0]
             if isinstance(ref_pose, torch.Tensor):
-                ref_position = ref_pose[:3, 3]
+                ref_position = ref_pose[:3, 3].cpu()
             else:
                 ref_position = torch.tensor(ref_pose[:3, 3])
             
-            distance = torch.norm(query_position - ref_position).item()
+            # Ensure both tensors are on CPU for distance calculation
+            distance = torch.norm(query_position.cpu() - ref_position).item()
             
             if distance < best_distance:
                 best_distance = distance
@@ -809,24 +827,205 @@ class VisualSLAM:
         
         return best_ref_idx, best_distance
     
+    def _visualize_matching_grid(
+        self,
+        query_img_tensor: torch.Tensor,
+        reference_db: List[Dict],
+        ref_indices: List[int],
+        match_counts: List[int],
+        best_ref_idx: int,
+        save_path: str,
+        title: str = "Reference Matching Results"
+    ):
+        """
+        Visualize matching results as a grid showing query and top reference matches.
+        
+        Args:
+            query_img_tensor: Query image tensor (C, H, W)
+            reference_db: List of reference database entries
+            ref_indices: Indices of reference frames that were matched
+            match_counts: Number of matches for each reference frame
+            best_ref_idx: Index of best matching reference frame
+            save_path: Path to save visualization
+            title: Title for the plot
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')
+        
+        # Denormalize query image for visualization
+        img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
+        mean = torch.as_tensor(img_norm.mean, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
+        std = torch.as_tensor(img_norm.std, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
+        
+        query_denorm = query_img_tensor * std + mean
+        query_denorm = torch.clamp(query_denorm * 255, 0, 255).byte()
+        query_img_np = query_denorm.permute(1, 2, 0).cpu().numpy()
+        
+        # Sort references by match count (descending)
+        sorted_pairs = sorted(zip(ref_indices, match_counts), key=lambda x: x[1], reverse=True)
+        top_k = min(5, len(sorted_pairs))  # Show top 5 matches
+        
+        # Create figure with grid: 1 query + top K references
+        fig, axes = plt.subplots(1, top_k + 1, figsize=(4 * (top_k + 1), 4))
+        if top_k == 0:
+            axes = [axes]
+        
+        # Plot query image
+        axes[0].imshow(query_img_np)
+        axes[0].set_title(f'Query Image', fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        # Plot top K reference matches
+        for i, (ref_idx, match_count) in enumerate(sorted_pairs[:top_k]):
+            ref_img_path = reference_db[ref_idx]['image_path']
+            ref_img_bgr = cv2.imread(ref_img_path)
+            if ref_img_bgr is not None:
+                ref_img_rgb = cv2.cvtColor(ref_img_bgr, cv2.COLOR_BGR2RGB)
+                axes[i + 1].imshow(ref_img_rgb)
+                
+                # Highlight best match
+                border_color = 'green' if ref_idx == best_ref_idx else 'gray'
+                border_width = 3 if ref_idx == best_ref_idx else 1
+                
+                axes[i + 1].set_title(
+                    f'Ref #{ref_idx}\n{match_count} matches',
+                    fontsize=12,
+                    fontweight='bold' if ref_idx == best_ref_idx else 'normal',
+                    color=border_color
+                )
+                
+                # Add colored border
+                for spine in axes[i + 1].spines.values():
+                    spine.set_edgecolor(border_color)
+                    spine.set_linewidth(border_width)
+                    spine.set_visible(True)
+            
+            axes[i + 1].axis('off')
+        
+        plt.suptitle(title, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved matching visualization to {save_path}")
+    
+    def _find_best_reference_by_image_matching(
+        self, 
+        query_img_tensor: torch.Tensor, 
+        reference_db: List[Dict], 
+        search_center_idx: int = 0,
+        search_window: int = 30,
+        min_matches: int = 1000
+    ) -> Tuple[int, int, List[int], List[int]]:
+        """
+        Find the best matching reference frame using LoFTR image matching.
+        
+        Args:
+            query_img_tensor: Query image tensor (B, C, H, W) or (C, H, W) normalized
+            reference_db: List of reference database entries
+            search_center_idx: Center index for search window
+            search_window: Number of frames to search on each side of center
+            min_matches: Minimum number of matches required
+            
+        Returns:
+            Tuple of (best_ref_idx, num_matches, all_ref_indices, all_match_counts)
+        """
+        # Squeeze batch dimension if present
+        if query_img_tensor.ndim == 4:
+            query_img_tensor = query_img_tensor.squeeze(0)
+        
+        # Define search range
+        start_idx = max(0, search_center_idx - search_window // 2)
+        end_idx = min(len(reference_db), search_center_idx + search_window // 2)
+        
+        best_ref_idx = -1
+        best_match_count = 0
+        all_ref_indices = list(range(start_idx, end_idx))
+        
+        print(f"  Searching for matches in reference frames [{start_idx}, {end_idx})")
+        
+        # Batch process all reference images for speed
+        ref_img_paths = [reference_db[idx]['image_path'] for idx in all_ref_indices]
+        
+        try:
+            all_match_counts = self.matcher.count_keypoint_matches_batch(
+                query_img_tensor,
+                ref_img_paths
+            )
+            
+            # Find best match
+            if all_match_counts:
+                best_match_count = max(all_match_counts)
+                if best_match_count > 0:
+                    best_idx_in_list = all_match_counts.index(best_match_count)
+                    best_ref_idx = all_ref_indices[best_idx_in_list]
+                    
+                    # Early termination if we found an excellent match
+                    if best_match_count > 2000:
+                        print(f"  Found excellent match (>{2000} matches) at reference frame {best_ref_idx}, terminating search early")
+                    
+        except Exception as e:
+            print(f"  Warning: Batch matching failed: {e}, falling back to sequential")
+            # Fallback to sequential matching with early termination
+            all_match_counts = []
+            for ref_idx in all_ref_indices:
+                ref_img_path = reference_db[ref_idx]['image_path']
+                try:
+                    num_matches = self.matcher.count_keypoint_matches(
+                        query_img_tensor, 
+                        ref_img_path, 
+                        return_details=False
+                    )
+                    all_match_counts.append(num_matches)
+                    
+                    if num_matches > best_match_count:
+                        best_match_count = num_matches
+                        best_ref_idx = ref_idx
+                        
+                        # Early termination if we found an excellent match
+                        if best_match_count > 2000:
+                            print(f"  Found excellent match (>{2000} matches) at reference frame {best_ref_idx}, terminating search early")
+                            # Fill remaining with zeros for consistency
+                            remaining = len(all_ref_indices) - len(all_match_counts)
+                            all_match_counts.extend([0] * remaining)
+                            break
+                            
+                except Exception as e2:
+                    print(f"  Warning: Failed to match with reference frame {ref_idx}: {e2}")
+                    all_match_counts.append(0)
+        
+        if best_match_count >= min_matches:
+            print(f"  Found best match at reference frame {best_ref_idx} with {best_match_count} matches")
+            return best_ref_idx, best_match_count, all_ref_indices, all_match_counts
+        else:
+            print(f"  No good match found (best: {best_match_count} < {min_matches} matches)")
+            return -1, 0, all_ref_indices, all_match_counts
+    
     def _prepare_relocalization_views(
-        self, current_chunk_paths: List[str], db_data: Tuple[List[Dict], torch.Tensor]
-    ) -> Tuple[List[Dict], List[str], torch.Tensor, torch.Tensor]:
+        self, current_chunk_paths: List[str], db_data: List[Dict]
+    ) -> Tuple[List[Dict], List[str], torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """
         Prepares views by adding reference priors based on spatial proximity.
         
         Strategy:
         - First chunk: Add first N reference frames as priors (assumes query starts near beginning of reference)
         - Subsequent chunks: Use last query pose to find closest reference, add N consecutive reference frames if within threshold
+        - Align using the LAST reference pose
         
         Returns:
-            Tuple of (view_set, paths_in_view_set, first_overlap_pose, current_vectors)
+            Tuple of (view_set, paths_in_view_set, first_overlap_pose, current_vectors, last_ref_pose, last_ref_idx_in_viewset)
         """
-        reference_db, reference_vectors = db_data
+        reference_db = db_data
         view_set = []
         paths_in_view_set = []
         first_overlap_pose = None
         current_vectors = None
+        last_ref_indices = []  # Will hold reference frames to add at the end
+        last_ref_pose = None  # Ground truth pose of last reference frame for alignment
+        last_ref_idx_in_viewset = -1  # Index of last reference view in view_set
         
         is_first_chunk = len(self.last_chunk_poses_for_fallback) == 0
         
@@ -840,22 +1039,116 @@ class VisualSLAM:
                 size=self.target_size,
             )
         
-        # ========== FIRST CHUNK: Add First N Reference Frames ==========
+        # ========== FIRST CHUNK: Use Image Matching to Find Best Reference Frames ==========
         if is_first_chunk:
-            print(f"[Chunk 1] Adding first {self.config.num_reference_priors} reference frames as priors...")
+            print(f"[Chunk 1] Using image matching to find best reference frames...")
             
-            # Add first N consecutive reference frames as priors
-            num_priors_to_add = min(self.config.num_reference_priors, len(reference_db))
-            for i in range(num_priors_to_add):
-                db_entry = reference_db[i]
+            # Get first and last query images for matching
+            first_query_img = current_views[0]['img']  # Already loaded
+            last_query_img = current_views[-1]['img']
+            
+            # Find best matching reference frame for the FIRST query image
+            print(f"  Matching first query image...")
+            first_ref_idx, first_matches, first_ref_indices, first_match_counts = self._find_best_reference_by_image_matching(
+                first_query_img,
+                reference_db,
+                search_center_idx=0,
+                search_window=30,
+                min_matches=1000
+            )
+            
+            # Visualize first query matching
+            if first_ref_indices:
+                vis_path = os.path.join(self.config.output_dir, "debug_matches", "chunk_1_first_query_matches.png")
+                self._visualize_matching_grid(
+                    first_query_img if first_query_img.ndim == 3 else first_query_img.squeeze(0),
+                    reference_db,
+                    first_ref_indices,
+                    first_match_counts,
+                    first_ref_idx,
+                    vis_path,
+                    title="Chunk 1 - First Query Image Matches"
+                )
+            
+            # Find best matching reference frame for the LAST query image
+            print(f"  Matching last query image...")
+            last_ref_idx, last_matches, last_ref_indices, last_match_counts = self._find_best_reference_by_image_matching(
+                last_query_img,
+                reference_db,
+                search_center_idx=self.config.chunk_size,
+                search_window=10,
+                min_matches=1000
+            )
+            
+            # Visualize last query matching
+            if last_ref_indices:
+                vis_path = os.path.join(self.config.output_dir, "debug_matches", "chunk_1_last_query_matches.png")
+                self._visualize_matching_grid(
+                    last_query_img if last_query_img.ndim == 3 else last_query_img.squeeze(0),
+                    reference_db,
+                    last_ref_indices,
+                    last_match_counts,
+                    last_ref_idx,
+                    vis_path,
+                    title="Chunk 1 - Last Query Image Matches"
+                )
+            
+            # Build list of reference indices to add (clear previous match results)
+            ref_indices_to_add_start = []
+            ref_indices_to_add_end = []
+            
+            if first_ref_idx >= 0:
+                ref_indices_to_add_start.append(first_ref_idx)
+                # Also add the next frame for temporal continuity
+                if first_ref_idx + 1 < len(reference_db):
+                    ref_indices_to_add_start.append(first_ref_idx + 1)
+                print(f"  Will add reference frames {ref_indices_to_add_start} at start")
+            else:
+                # Fallback to beginning of reference if no match
+                ref_indices_to_add_start = [0]
+                print(f"  No good match for first query, using reference frame 0")
+            
+            if last_ref_idx >= 0 and last_ref_idx not in ref_indices_to_add_start:
+                ref_indices_to_add_end.append(last_ref_idx)
+                print(f"  Will add reference frame {last_ref_idx} at end")
+            else:
+                # Fallback or skip if already added
+                if last_ref_idx < 0:
+                    # Use chunk_size as fallback
+                    fallback_idx = min(self.config.chunk_size, len(reference_db) - 1)
+                    if fallback_idx not in ref_indices_to_add_start:
+                        ref_indices_to_add_end.append(fallback_idx)
+                        print(f"  No good match for last query, using reference frame {fallback_idx}")
+            
+            # Load and add first 2 reference priors at the start
+            for i, idx in enumerate(ref_indices_to_add_start):
+                if idx >= len(reference_db):
+                    continue
+                db_entry = reference_db[idx]
                 db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
                 ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
                 if not isinstance(ref_intrinsics, torch.Tensor):
                     ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
+                
+                # Load depth if available
+                depth_z = None
+                if 'depth_path' in db_entry and os.path.exists(db_entry['depth_path']):
+                    try:
+                        depth_np = np.load(db_entry['depth_path'])
+                        depth_z = torch.from_numpy(depth_np).to(self.device)
+                        print(f"  Loaded depth prior from {os.path.basename(db_entry['depth_path'])}")
+                    except Exception as e:
+                        print(f"  Warning: Could not load depth from {db_entry['depth_path']}: {e}")
+                
                 db_view.update({
                     "intrinsics": ref_intrinsics,
-                    "camera_poses": db_entry['camera_poses'].to(self.device)
+                    "camera_poses": db_entry['camera_poses'].to(self.device),
+                    "is_metric_scale": torch.tensor([True], device=self.device)
                 })
+                
+                if depth_z is not None:
+                    db_view["depth_z"] = depth_z
+                
                 view_set.append(db_view)
                 paths_in_view_set.append(db_entry['image_path'])
                 
@@ -863,51 +1156,96 @@ class VisualSLAM:
                     first_overlap_pose = db_entry['camera_poses'].to(self.device)
             
             # Store reference index for next chunk
-            self.current_ref_idx = num_priors_to_add - 1
-            print(f"  ✓ Added reference frames 0 to {num_priors_to_add - 1}")
-        
-        # ========== SUBSEQUENT CHUNKS: Use Spatial Distance Matching ==========
-        else:
-            print(f"[Chunk N] Using spatial distance to find closest reference...")
+            self.current_ref_idx = self.config.chunk_size + 1
+            print(f"  ✓ Added {len(ref_indices_to_add_start)} reference priors at start for first chunk")
             
-            # Get last query pose from previous chunk
+            # Store for later addition at end
+            last_ref_indices = ref_indices_to_add_end
+        
+        # ========== SUBSEQUENT CHUNKS: Add Query Overlap First, Then Reference ==========
+        else:
+            print(f"[Chunk N] Using image matching to find best reference frames...")
+            
+            # Get last query pose from previous chunk for search window centering
             last_query_path = list(self.last_chunk_poses_for_fallback.keys())[-1]
             last_query_pose = self.last_chunk_poses_for_fallback[last_query_path]
             
-            # Find closest reference pose across ALL reference frames
-            ref_idx, distance = self._find_closest_reference_by_spatial_distance(
+            # Find closest reference by spatial distance to center the search window
+            center_ref_idx, distance = self._find_closest_reference_by_spatial_distance(
                 last_query_pose, reference_db, search_start_idx=None, search_window=None
             )
             
-            print(f"  Closest reference frame: {ref_idx} at distance {distance:.3f}m")
+            print(f"  Using reference frame {center_ref_idx} (distance {distance:.3f}m) as search center")
             
-            # If within threshold: add reference priors
-            if distance <= self.config.spatial_distance_threshold_m:
-                print(f"  ✓ Within threshold ({self.config.spatial_distance_threshold_m}m), adding {self.config.num_reference_priors} reference priors")
-                
-                # Add N consecutive reference frames as priors
-                num_priors_to_add = min(self.config.num_reference_priors, len(reference_db) - ref_idx)
-                for i in range(num_priors_to_add):
-                    idx = ref_idx + i
-                    db_entry = reference_db[idx]
-                    db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
-                    ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
-                    if not isinstance(ref_intrinsics, torch.Tensor):
-                        ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
-                    db_view.update({
-                        "intrinsics": ref_intrinsics,
-                        "camera_poses": db_entry['camera_poses'].to(self.device)
-                    })
-                    view_set.append(db_view)
-                    paths_in_view_set.append(db_entry['image_path'])
-                    
-                    if i == 0:
-                        first_overlap_pose = db_entry['camera_poses'].to(self.device)
-                
-                self.current_ref_idx = ref_idx + num_priors_to_add - 1
-                print(f"  Added reference frames {ref_idx} to {ref_idx + num_priors_to_add - 1}")
-            else:
-                print(f"  ✗ Distance {distance:.3f}m exceeds threshold, continuing sequential reconstruction")
+            # Get first and last query images for matching
+            first_query_img = current_views[0]['img']
+            last_query_img = current_views[-1]['img']
+            
+            # Find best matching reference frame for the FIRST query image
+            # Search around center_ref_idx since first query is from overlap with previous chunk
+            print(f"  Matching first query image...")
+            search_center_first = center_ref_idx
+            print(f"  Searching for first query image in reference frames around {search_center_first} (window=5)")
+            first_ref_idx, first_matches, first_ref_indices_match, first_match_counts_match = self._find_best_reference_by_image_matching(
+                first_query_img,
+                reference_db,
+                search_center_idx=search_center_first,
+                search_window=5,
+                min_matches=1000
+            )
+            
+            # Visualize first query matching
+            if first_ref_indices_match:
+                chunk_dirs = glob.glob(os.path.join(self.config.output_dir, "chunk_*"))
+                chunk_num = len(chunk_dirs) + 1
+                vis_path = os.path.join(self.config.output_dir, "debug_matches", f"chunk_{chunk_num}_first_query_matches.png")
+                self._visualize_matching_grid(
+                    first_query_img if first_query_img.ndim == 3 else first_query_img.squeeze(0),
+                    reference_db,
+                    first_ref_indices_match,
+                    first_match_counts_match,
+                    first_ref_idx,
+                    vis_path,
+                    title=f"Chunk {chunk_num} - First Query Image Matches"
+                )
+            
+            # Find best matching reference frame for the LAST query image
+            # Search center should be ahead of where the previous chunk ended
+            print(f"  Matching last query image...")
+            search_center_last = min(len(reference_db) - 1, center_ref_idx + self.config.chunk_size)
+            print(f"  Searching for last query image in reference frames [{center_ref_idx}, {search_center_last + 5})")
+            last_ref_idx, last_matches, last_ref_indices_match, last_match_counts_match = self._find_best_reference_by_image_matching(
+                last_query_img,
+                reference_db,
+                search_center_idx=search_center_last,
+                search_window=5,
+                min_matches=1000
+            )
+            
+            # Visualize last query matching
+            if last_ref_indices_match:
+                chunk_dirs = glob.glob(os.path.join(self.config.output_dir, "chunk_*"))
+                chunk_num = len(chunk_dirs) + 1
+                vis_path = os.path.join(self.config.output_dir, "debug_matches", f"chunk_{chunk_num}_last_query_matches.png")
+                self._visualize_matching_grid(
+                    last_query_img if last_query_img.ndim == 3 else last_query_img.squeeze(0),
+                    reference_db,
+                    last_ref_indices_match,
+                    last_match_counts_match,
+                    last_ref_idx,
+                    vis_path,
+                    title=f"Chunk {chunk_num} - Last Query Image Matches"
+                )
+            
+            # Determine which reference frames to add
+            first_ref_to_add = first_ref_idx if first_ref_idx >= 0 else max(0, center_ref_idx - self.config.chunk_size)
+            last_ref_to_add = last_ref_idx if last_ref_idx >= 0 else min(center_ref_idx, len(reference_db) - 1)
+            
+            print(f"  Will add reference frame {first_ref_to_add} after overlap, and {last_ref_to_add} at end")
+            
+            # Store reference indices for later (will be added after overlap in correct order)
+            ref_frame_to_add_after_overlap = first_ref_to_add
+            last_ref_indices = [last_ref_to_add]
         
         # ========== Add Sequential Overlap from Previous Query Chunk ==========
         overlapping_sequential_paths = [
@@ -931,10 +1269,42 @@ class VisualSLAM:
             view_set.extend(overlap_views)
             paths_in_view_set.extend(overlapping_sequential_paths)
             
-            # If no reference priors were found, use first sequential overlap for alignment
+            # For subsequent chunks, set first_overlap_pose to FIRST overlap frame (index 0 in view_set)
             if first_overlap_pose is None and overlapping_sequential_paths:
                 first_overlap_pose = self.last_chunk_poses_for_fallback[overlapping_sequential_paths[0]]
-                print(f"  Using first sequential overlap as alignment anchor")
+                print(f"  Using first sequential overlap (index 0) as alignment anchor")
+        
+        # ========== Add First Reference Frame (Subsequent Chunks Only) ==========
+        # For subsequent chunks, add first matching reference frame AFTER overlap
+        if not is_first_chunk and 'ref_frame_to_add_after_overlap' in locals():
+            print(f"  Adding first reference frame {ref_frame_to_add_after_overlap} after overlap")
+            db_entry = reference_db[ref_frame_to_add_after_overlap]
+            db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
+            ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
+            if not isinstance(ref_intrinsics, torch.Tensor):
+                ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
+            
+            # Load depth if available
+            depth_z = None
+            if 'depth_path' in db_entry and os.path.exists(db_entry['depth_path']):
+                try:
+                    depth_np = np.load(db_entry['depth_path'])
+                    depth_z = torch.from_numpy(depth_np).to(self.device)
+                    print(f"  Loaded depth prior from {os.path.basename(db_entry['depth_path'])}")
+                except Exception as e:
+                    print(f"  Warning: Could not load depth from {db_entry['depth_path']}: {e}")
+            
+            db_view.update({
+                "intrinsics": ref_intrinsics,
+                "camera_poses": db_entry['camera_poses'].to(self.device),
+                "is_metric_scale": torch.tensor([True], device=self.device)
+            })
+            
+            if depth_z is not None:
+                db_view["depth_z"] = depth_z
+            
+            view_set.append(db_view)
+            paths_in_view_set.append(db_entry['image_path'])
         
         # ========== Add New (Unposed) Query Views ==========
         new_query_paths = [p for p in current_chunk_paths if p not in paths_in_view_set]
@@ -945,9 +1315,49 @@ class VisualSLAM:
             view_set.append(view)
         paths_in_view_set.extend(new_query_paths)
         
-        print(f"  Total views in set: {len(view_set)} ({len(view_set) - len(new_query_paths)} priors, {len(new_query_paths)} new)")
+        # ========== Add Last Reference Frame(s) at the End ==========
+        if last_ref_indices:
+            print(f"  Adding {len(last_ref_indices)} reference prior(s) at the end")
+            for idx in last_ref_indices:
+                if idx >= len(reference_db):
+                    continue
+                db_entry = reference_db[idx]
+                db_view = load_images([db_entry['image_path']], resize_mode="fixed_size", size=self.target_size)[0]
+                ref_intrinsics = db_entry.get('intrinsics', self.intrinsics)
+                if not isinstance(ref_intrinsics, torch.Tensor):
+                    ref_intrinsics = torch.tensor(ref_intrinsics, dtype=torch.float32)
+                
+                # Load depth if available
+                depth_z = None
+                if 'depth_path' in db_entry and os.path.exists(db_entry['depth_path']):
+                    try:
+                        depth_np = np.load(db_entry['depth_path'])
+                        depth_z = torch.from_numpy(depth_np).to(self.device)
+                        print(f"  Loaded depth prior from {os.path.basename(db_entry['depth_path'])}")
+                    except Exception as e:
+                        print(f"  Warning: Could not load depth from {db_entry['depth_path']}: {e}")
+                
+                db_view.update({
+                    "intrinsics": ref_intrinsics,
+                    "camera_poses": db_entry['camera_poses'].to(self.device),
+                    "is_metric_scale": torch.tensor([True], device=self.device)
+                })
+                
+                if depth_z is not None:
+                    db_view["depth_z"] = depth_z
+                
+                # Track the LAST reference pose for alignment (this will be the final one added)
+                last_ref_pose = db_entry['camera_poses'].to(self.device)
+                last_ref_idx_in_viewset = len(view_set)
+                
+                view_set.append(db_view)
+                paths_in_view_set.append(db_entry['image_path'])
         
-        return view_set, paths_in_view_set, first_overlap_pose, current_vectors
+        print(f"  Total views in set: {len(view_set)} ({len(view_set) - len(new_query_paths)} priors, {len(new_query_paths)} new)")
+        if last_ref_pose is not None:
+            print(f"  Will use last reference pose (index {last_ref_idx_in_viewset}) for alignment")
+        
+        return view_set, paths_in_view_set, first_overlap_pose, current_vectors, last_ref_pose, last_ref_idx_in_viewset
 
     def _align_saved_chunks(self, alignment_transform: torch.Tensor):
         """Iterates through all saved chunks and applies the final alignment transform to them."""
@@ -1065,7 +1475,7 @@ class VisualSLAM:
                             entry["gps_ned"] = torch.tensor(self.gps_ned[tns], dtype=torch.float32)
             except Exception as e:
                 print(f"Warning: Could not attach GPS NED for {paths[i]}: {e}")
-            # Persist the RGB frame used for reconstruction and repoint image_path to it
+            # Persist the RGB frame and depth map used for reconstruction
             try:
                 if images_dir is not None and 'img_no_norm' in pred:
                     # Derive a stable filename from the original path identifier
@@ -1073,8 +1483,10 @@ class VisualSLAM:
                     name, _sep, _ext = base.partition('.')
                     if not name:
                         name = base
-                    filename = f"{name}.jpg"
-                    save_path = os.path.join(images_dir, filename)
+                    
+                    # Save RGB image
+                    rgb_filename = f"{name}.jpg"
+                    rgb_save_path = os.path.join(images_dir, rgb_filename)
 
                     # Convert denormalized image [0,1] (H,W,3) to uint8 RGB
                     img = pred['img_no_norm']
@@ -1088,13 +1500,36 @@ class VisualSLAM:
                     img_uint8 = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
 
                     # Write as JPEG (convert RGB->BGR for OpenCV)
-                    if not os.path.exists(save_path):
-                        cv2.imwrite(save_path, cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR))
+                    if not os.path.exists(rgb_save_path):
+                        cv2.imwrite(rgb_save_path, cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR))
 
                     # Update entry to point to the saved RGB frame
-                    entry["image_path"] = save_path
+                    entry["image_path"] = rgb_save_path
+                    
+                    # Save depth map as .npy file
+                    if 'depth_z' in pred:
+                        depth_filename = f"{name}_depth.npy"
+                        depth_save_path = os.path.join(images_dir, depth_filename)
+                        
+                        # Extract depth_z tensor
+                        depth_z = pred['depth_z']
+                        if isinstance(depth_z, torch.Tensor):
+                            # Remove batch dimension if present
+                            if depth_z.ndim == 4:  # (B, 1, H, W)
+                                depth_z = depth_z[0]
+                            depth_np = depth_z.detach().cpu().numpy()
+                        else:
+                            depth_np = np.array(depth_z)
+                        
+                        # Save depth as numpy file
+                        if not os.path.exists(depth_save_path):
+                            np.save(depth_save_path, depth_np)
+                        
+                        # Store depth path in database entry
+                        entry["depth_path"] = depth_save_path
+
             except Exception as e:
-                print(f"Warning: Failed to save/reference RGB frame for database entry {paths[i]}: {e}")
+                print(f"Warning: Failed to save/reference RGB frame or depth for database entry {paths[i]}: {e}")
             
             processed_data.append(entry)
         return processed_data

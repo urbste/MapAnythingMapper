@@ -15,22 +15,122 @@ from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_
 class Matcher:
     """Handles keypoint matching and visualization using EfficientLoFTR."""
     
-    def __init__(self, device: str = "cuda", keypoint_matching_threshold: float = 0.2):
+    def __init__(self, device: str = "cuda", keypoint_matching_threshold: float = 0.2, max_resolution: int = 640):
         """
         Initialize the Matcher with EfficientLoFTR model.
         
         Args:
             device: Device to run the model on ('cuda' or 'cpu')
             keypoint_matching_threshold: Threshold for keypoint matching confidence
+            max_resolution: Maximum resolution (longest edge) for matching. Default 640px.
+                           Smaller values = faster matching but potentially fewer matches.
+                           EfficientLoFTR default is 640x480.
         """
         self.device = device
         self.keypoint_matching_threshold = keypoint_matching_threshold
+        self.max_resolution = max_resolution
         
-        print("Initializing EfficientLoFTR model for Matcher...")
+        print(f"Initializing EfficientLoFTR model for Matcher (max_resolution={max_resolution})...")
         self.loftr_processor = AutoImageProcessor.from_pretrained("zju-community/efficientloftr")
         self.loftr_model = AutoModelForKeypointMatching.from_pretrained("zju-community/efficientloftr")
         self.loftr_model = self.loftr_model.to(self.device).eval()
         print("EfficientLoFTR model initialized in Matcher.")
+    
+    def _resize_image_pil(self, pil_image: Image.Image) -> Image.Image:
+        """
+        Resize PIL image to max_resolution while maintaining aspect ratio.
+        
+        Args:
+            pil_image: PIL Image to resize
+            
+        Returns:
+            Resized PIL Image
+        """
+        width, height = pil_image.size
+        max_dim = max(width, height)
+        
+        if max_dim > self.max_resolution:
+            scale = self.max_resolution / max_dim
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            return pil_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+        
+        return pil_image
+    
+    def count_keypoint_matches_batch(
+        self,
+        query_img_tensor: torch.Tensor,
+        ref_img_paths: list,
+    ) -> list:
+        """
+        Count keypoint matches between one query image and multiple reference images in batch.
+        This is much faster than calling count_keypoint_matches multiple times.
+        
+        Args:
+            query_img_tensor: Query image tensor (normalized, C x H x W)
+            ref_img_paths: List of paths to reference images
+            
+        Returns:
+            List of match counts for each reference image
+        """
+        try:
+            # Convert query tensor back to PIL Image
+            img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
+            mean = torch.as_tensor(img_norm.mean, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
+            std = torch.as_tensor(img_norm.std, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
+            
+            query_denorm = query_img_tensor * std + mean
+            query_denorm = torch.clamp(query_denorm * 255, 0, 255).byte()
+            query_img_np = query_denorm.permute(1, 2, 0).cpu().numpy()
+            query_pil = Image.fromarray(query_img_np)
+            query_pil = self._resize_image_pil(query_pil)
+            
+            match_counts = []
+            
+            # Process each reference image
+            for ref_img_path in ref_img_paths:
+                ref_img_bgr = cv2.imread(ref_img_path)
+                if ref_img_bgr is None:
+                    print(f"Warning: Could not load reference image {ref_img_path}")
+                    match_counts.append(0)
+                    continue
+                
+                ref_img_rgb = cv2.cvtColor(ref_img_bgr, cv2.COLOR_BGR2RGB)
+                ref_pil = Image.fromarray(ref_img_rgb)
+                ref_pil = self._resize_image_pil(ref_pil)
+                
+                # Prepare images for EfficientLoFTR
+                images = [query_pil, ref_pil]
+                inputs = self.loftr_processor(images, return_tensors="pt")
+                
+                # Move inputs to device
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                # Run matching
+                with torch.inference_mode():
+                    outputs = self.loftr_model(**inputs)
+                
+                # Process outputs with matching threshold
+                image_sizes = [[(image.height, image.width) for image in images]]
+                threshold = self.keypoint_matching_threshold
+                processed_outputs = self.loftr_processor.post_process_keypoint_matching(
+                    outputs, image_sizes, threshold=threshold
+                )
+                
+                # Extract match count
+                if len(processed_outputs) > 0:
+                    output = processed_outputs[0]
+                    num_matches = len(output["keypoints0"])
+                else:
+                    num_matches = 0
+                
+                match_counts.append(num_matches)
+            
+            return match_counts
+            
+        except Exception as e:
+            print(f"Warning: Batch keypoint matching failed: {e}")
+            return [0] * len(ref_img_paths)
     
     def count_keypoint_matches(
         self, 
@@ -53,13 +153,14 @@ class Matcher:
             # Convert query tensor back to PIL Image
             # Denormalize using dinov2 normalization
             img_norm = IMAGE_NORMALIZATION_DICT["dinov2"]
-            mean = torch.tensor(img_norm.mean).view(3, 1, 1).to(query_img_tensor.device)
-            std = torch.tensor(img_norm.std).view(3, 1, 1).to(query_img_tensor.device)
+            mean = torch.as_tensor(img_norm.mean, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
+            std = torch.as_tensor(img_norm.std, dtype=torch.float32).view(3, 1, 1).to(query_img_tensor.device)
             
             query_denorm = query_img_tensor * std + mean
             query_denorm = torch.clamp(query_denorm * 255, 0, 255).byte()
             query_img_np = query_denorm.permute(1, 2, 0).cpu().numpy()
             query_pil = Image.fromarray(query_img_np)
+            query_pil = self._resize_image_pil(query_pil)
             
             # Load reference image
             ref_img_bgr = cv2.imread(ref_img_path)
@@ -70,6 +171,7 @@ class Matcher:
                 return 0
             ref_img_rgb = cv2.cvtColor(ref_img_bgr, cv2.COLOR_BGR2RGB)
             ref_pil = Image.fromarray(ref_img_rgb)
+            ref_pil = self._resize_image_pil(ref_pil)
             
             # Prepare images for EfficientLoFTR
             images = [query_pil, ref_pil]

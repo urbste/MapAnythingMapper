@@ -537,10 +537,11 @@ def project_trajectory_to_image(trajectory_3d, current_pose, intrinsics, current
     # Filter based on distance and trajectory direction (only show upcoming trajectory)
     distance_mask = distances <= max_distance
     
-    # If we know the current index, only show trajectory ahead
+    # If we know the current index, only show trajectory ahead (limited to next 30 poses)
     if current_idx is not None:
         future_mask = np.zeros(len(trajectory_3d), dtype=bool)
-        future_mask[current_idx:] = True  # Only show current and future points
+        end_idx = min(current_idx + 30, len(trajectory_3d))  # Limit to next 30 poses
+        future_mask[current_idx:end_idx] = True  # Only show current and next 30 points
         distance_mask = distance_mask & future_mask
     
     # Transform points to camera space
@@ -727,6 +728,15 @@ def synchronize_trajectories(ref_data, query_data, ref_stride=1, query_stride=1)
     ref_timestamps = np.array(ref_timestamps)
     query_timestamps = np.array(query_timestamps)
     
+    # Align both trajectories to start at time 0
+    ref_start_time = ref_timestamps[0]
+    query_start_time = query_timestamps[0]
+    ref_timestamps = ref_timestamps - ref_start_time  # Normalize to start at 0
+    query_timestamps = query_timestamps - query_start_time  # Normalize to start at 0
+    
+    print(f"Aligned reference trajectory to start at time 0 (original start: {ref_start_time / 1e9:.2f}s)")
+    print(f"Aligned query trajectory to start at time 0 (original start: {query_start_time / 1e9:.2f}s)")
+    
     # Find overlapping time range
     time_start = max(ref_timestamps[0], query_timestamps[0])
     time_end = min(ref_timestamps[-1], query_timestamps[-1])
@@ -760,16 +770,21 @@ def synchronize_trajectories(ref_data, query_data, ref_stride=1, query_stride=1)
             time_diffs.append(t_diff)
     
     print(f"Synchronized {len(ref_sync_indices)} poses")
-    print(f"Average distance: {np.mean(distances):.2f}m (min={np.min(distances):.2f}m, max={np.max(distances):.2f}m)")
-    print(f"Average time difference: {np.mean(np.abs(time_diffs)):.2f}s (range: [{np.min(time_diffs):.2f}s, {np.max(time_diffs):.2f}s])")
     
-    if len(time_diffs) > 0:
-        ref_ahead_count = np.sum(time_diffs < 0)
-        query_ahead_count = np.sum(time_diffs > 0)
+    # Convert lists to numpy arrays
+    time_diffs_arr = np.array(time_diffs)
+    distances_arr = np.array(distances)
+    
+    print(f"Average distance: {np.mean(distances_arr):.2f}m (min={np.min(distances_arr):.2f}m, max={np.max(distances_arr):.2f}m)")
+    print(f"Average time difference: {np.mean(np.abs(time_diffs_arr)):.2f}s (range: [{np.min(time_diffs_arr):.2f}s, {np.max(time_diffs_arr):.2f}s])")
+    
+    if len(time_diffs_arr) > 0:
+        ref_ahead_count = np.sum(time_diffs_arr < 0)
+        query_ahead_count = np.sum(time_diffs_arr > 0)
         print(f"  Reference ahead in {ref_ahead_count} frames, Query ahead in {query_ahead_count} frames")
     
-    return (ref_sync_indices, query_sync_indices, np.array(time_diffs), 
-            np.array(distances), (ref_traj_3d, query_traj_3d, ref_poses, query_poses))
+    return (ref_sync_indices, query_sync_indices, time_diffs_arr, 
+            distances_arr, (ref_traj_3d, query_traj_3d, ref_poses, query_poses))
 
 
 def project_ground_circle_to_image(position_3d, normal, camera_pose, intrinsics, radius=0.5, num_points=20):
@@ -1350,7 +1365,7 @@ def render_trajectory_to_video(video_path, output_dir, output_video_path=None,
                     )
  
         cv2.imshow("Trajectory Overlay", frame)
-        cv2.waitKey(1)
+        cv2.waitKey(30)
         # Write frame
         out.write(frame)
         frame_idx += 1

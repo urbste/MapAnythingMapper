@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
     # --- Sequence Control ---
     parser.add_argument("--start_time", type=float, default=9.0, help="Start time in seconds for video processing.")
-    parser.add_argument("--end_time", type=float, default=118.0, help="End time in seconds for video processing (-1 for entire video).")
+    parser.add_argument("--end_time", type=float, default=60, help="End time in seconds for video processing (-1 for entire video).")
     parser.add_argument("--stride", type=int, default=2, help="Process every Nth frame.")
 
     # --- SLAM Parameters ---
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--pcl_confidence", type=float, default=0.8, help="Confidence threshold for points in the point cloud.")
     
     # --- Visualization ---
-    parser.add_argument("--visualize", action='store_true', default=False, help="Enable post-processing and visualization of the results.")
+    parser.add_argument("--visualize", action='store_true', default=True, help="Enable post-processing and visualization of the results.")
     parser.add_argument("--debug_viz", action='store_true', default=False, help="Enable saving of debug visualizations for each chunk.")
 
     args = parser.parse_args()

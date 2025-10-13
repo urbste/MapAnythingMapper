@@ -25,13 +25,10 @@ class SLAMConfig:
     # --- Relocalization ---
     relocalization_db_path: str = None # Path to an existing slam_database.pt for relocalization
     create_debug_matches: bool = False # If True, saves images of the relocalization matches
-    relocalization_threshold_percent: float = 10 # Threshold for the relocalization matches in percent
-    max_relocalization_threshold: float = 0.23
     relocalization_frame_overlap: int = 4 # Number of frames to overlap at start and end of a localized sequence
     keypoint_matching_threshold: float = 0.2 # Confidence threshold for keypoint matches in relocalization
     min_keypoint_matches: int = 1000 # Minimum number of keypoint matches required for relocalization
-    spatial_distance_threshold_m: float = 1.0 # Max spatial distance (meters) for accepting a reference pose as prior
-    num_reference_priors: int = 3 # Number of consecutive reference frames to add as priors when within distance threshold
+    spatial_distance_threshold_m: float = 5.0 # Max spatial distance (meters) for accepting a reference pose as prior
     
     # --- Point Cloud Generation ---
     max_depth_for_point_cloud: float = 5.0 # Max depth in meters to include in the final PCL
